@@ -44,7 +44,7 @@
 
 // ---------------- BLE ----------------
 #define DEV_NAME     "ROADLINK-HUD"
-#define FW_VERSION   "knight-hud/2.0"
+#define FW_VERSION   "knight-hud/2.1"
 #define SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 #define TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -392,10 +392,62 @@ void drawGate() {
   u8g2.drawUTF8(3, 62, "BOOT 确认 · 长按取消");
 }
 
+void drawHudArrowHead(int x, int y, int dx, int dy) {
+  u8g2.drawTriangle(x, y, x - 9 * dx + 5 * dy, y - 9 * dy - 5 * dx,
+                    x - 9 * dx - 5 * dy, y - 9 * dy + 5 * dx);
+}
+
+bool drawHudTurn(const char *turn) {
+  int horizontal = 0;
+  if (!strcmp(turn, "左转") || !strcmp(turn, "环岛左转")) horizontal = -1;
+  if (!strcmp(turn, "右转") || !strcmp(turn, "环岛右转")) horizontal = 1;
+  if (horizontal) {
+    int tip = horizontal < 0 ? 9 : 47;
+    u8g2.drawBox(26, 25, 5, 24);
+    u8g2.drawBox(horizontal < 0 ? tip + 5 : 28, 25, 15, 5);
+    drawHudArrowHead(tip, 27, horizontal, 0);
+    return true;
+  }
+  if (!strcmp(turn, "直行") || !strcmp(turn, "环岛直行")) {
+    u8g2.drawBox(26, 20, 5, 29);
+    drawHudArrowHead(28, 14, 0, -1);
+    return true;
+  }
+  if (!strcmp(turn, "掉头") || !strcmp(turn, "环岛掉头")) {
+    u8g2.drawBox(13, 19, 5, 30);
+    u8g2.drawBox(13, 18, 26, 5);
+    u8g2.drawBox(34, 19, 5, 20);
+    drawHudArrowHead(36, 45, 0, 1);
+    return true;
+  }
+  int dx = 0;
+  int dy = -1;
+  if (!strcmp(turn, "向左前")) dx = -1;
+  if (!strcmp(turn, "向右前")) dx = 1;
+  if (!strcmp(turn, "向左后")) { dx = -1; dy = 1; }
+  if (!strcmp(turn, "向右后")) { dx = 1; dy = 1; }
+  if (!dx) return false;
+  int tipX = 28 + 14 * dx;
+  int tipY = 31 + 14 * dy;
+  for (int offset = -1; offset <= 1; offset++) {
+    u8g2.drawLine(28 - 12 * dx + offset, 31 - 12 * dy, tipX + offset, tipY);
+  }
+  drawHudArrowHead(tipX, tipY, dx, dy);
+  return true;
+}
+
 void drawHud() {
   u8g2.setFont(u8g2_font_wqy16_t_gb2312);
   const char *l1 = hud1[0] ? hud1 : "骑士";
   const char *l2 = hud2[0] ? hud2 : "已连接";
+  int detailWidth = u8g2.getUTF8Width(l2);
+  if (l2[0] >= '0' && l2[0] <= '9' && detailWidth <= 70 && drawHudTurn(l1)) {
+    int gutter = 54;
+    u8g2.drawVLine(gutter, 10, 44);
+    u8g2.drawUTF8(gutter + (128 - gutter - u8g2.getUTF8Width(l1)) / 2, 27, l1);
+    u8g2.drawUTF8(gutter + (128 - gutter - detailWidth) / 2, 49, l2);
+    return;
+  }
   int w1 = u8g2.getUTF8Width(l1);
   int w2 = u8g2.getUTF8Width(l2);
   u8g2.drawUTF8((128 - w1) / 2, 30, l1);

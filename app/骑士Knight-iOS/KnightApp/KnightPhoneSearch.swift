@@ -65,7 +65,7 @@ final class KnightPhoneSearch {
 
     func startPickup(_ task: KnightPickupTask, report: @escaping @MainActor (KnightPickupResult) async -> Void) {
         guard !busy, UIApplication.shared.applicationState == .active else {
-            Task { await report(.stopped("请保持骑士 App 在前台，稍后重新发起任务", nil)) }
+            Task { await report(.stopped("请保持骑士 App 在前台，稍后重新发起任务", nil, nil, false)) }
             return
         }
         let operation = BlockOperation()
@@ -79,7 +79,7 @@ final class KnightPhoneSearch {
             let result: KnightPickupResult
             let plan = PhonePickupPlan(task: task, operation: operation)
             do { result = .ready(try plan.run(), plan.navigation) }
-            catch { result = .stopped(error.localizedDescription, plan.navigation) }
+            catch { result = .stopped(error.localizedDescription, plan.navigation, plan.clarification, plan.cartAdded) }
             Task { @MainActor in
                 await report(result)
                 self?.endBackgroundTask()
@@ -321,6 +321,8 @@ struct KnightPickupTask: Decodable {
     let budgetCents: Int
     let pickupDestination: String
     let expiresIn: Int
+    let expectedPickupStore: String?
+    let voiceRequest: Bool?
 }
 
 struct KnightPickupQuote: Codable {
@@ -333,7 +335,7 @@ struct KnightPickupQuote: Codable {
 
 enum KnightPickupResult {
     case ready(KnightPickupQuote, KnightPickupPlace?)
-    case stopped(String, KnightPickupPlace?)
+    case stopped(String, KnightPickupPlace?, String?, Bool)
 }
 
 private final class PhonePickupPlan {
@@ -347,6 +349,8 @@ private final class PhonePickupPlan {
     private let operation: Operation
     private let deadline: TimeInterval
     private(set) var navigation: KnightPickupPlace?
+    private(set) var clarification: String?
+    private(set) var cartAdded = false
     private var phaseStarted = ProcessInfo.processInfo.systemUptime
     private var screenReads = 0
     private var screenReadSeconds = 0.0
@@ -407,7 +411,7 @@ private final class PhonePickupPlan {
 
     private func wait(timeoutMessage: String = "美团未显示预期页面，请核对当前页面", attempts: Int = 5,
                       interval: TimeInterval = 0.28, openingApp: Bool = false,
-                      _ predicate: (PhoneControlTree) -> Bool) throws -> PhoneControlTree {
+                      _ predicate: (PhoneControlTree) throws -> Bool) throws -> PhoneControlTree {
         var last: PhoneControlTree?
         for attempt in 0..<attempts {
             if attempt > 0 {
@@ -419,7 +423,7 @@ private final class PhonePickupPlan {
             } catch let stop as Stop where openingApp && stop.message == fail("未读到美团页面").message {
                 continue
             }
-            if predicate(page) { return page }
+            if try predicate(page) { return page }
             last = page
         }
         if let last {
@@ -1145,6 +1149,39 @@ private final class PhonePickupPlan {
             !sugarLabels.contains { hasOption("无糖", in: $0) }
     }
 
+    private func visibleVerifiedCartPoint(item: String, options: [String]) throws -> CGPoint? {
+        let panel = CGRect(x: 0.055, y: 0.18, width: 0.90, height: 0.74)
+        guard let screen = try readStorefrontImage(region: panel) else { return nil }
+        let titles = screen.text.filter { locationKey($0.0) == locationKey(item) && (0.81...0.9).contains($0.1.midY) }
+        let selections = screen.text.filter { $0.0.hasPrefix("已选规格") && (0.24...0.32).contains($0.1.midY) }
+        let cart = screen.text.filter { locationKey($0.0).hasSuffix("加入购物车") &&
+            (0.65...0.94).contains($0.1.midX) && (0.19...0.25).contains($0.1.midY) }
+        guard titles.count == 1, selections.count == 1, cart.count == 1, let summary = selections.first,
+              options.allSatisfy({ hasOption($0, in: summary.0) }), let target = cart.first else { return nil }
+        return CGPoint(x: screen.bounds.minX + screen.bounds.width * target.1.midX,
+                       y: screen.bounds.minY + screen.bounds.height * (1 - target.1.midY))
+    }
+
+    private func visibleCheckout(item: String, options: [String]) throws -> (button: CGPoint, dismiss: CGPoint?)? {
+        let region = CGRect(x: 0.025, y: 0.035, width: 0.95, height: 0.88)
+        guard let screen = try readStorefrontImage(region: region) else { return nil }
+        let buttons = screen.text.filter { locationKey($0.0) == "去结算" &&
+            (0.68...0.97).contains($0.1.midX) && (0.045...0.125).contains($0.1.midY) }
+        guard buttons.count == 1, let button = buttons.first else { return nil }
+        let checkout = CGPoint(x: screen.bounds.minX + button.1.midX * screen.bounds.width,
+                               y: screen.bounds.minY + (1 - button.1.midY) * screen.bounds.height)
+        let selections = screen.text.filter { $0.0.hasPrefix("已选规格") && (0.22...0.34).contains($0.1.midY) }
+        guard !selections.isEmpty else { return (checkout, nil) }
+        guard selections.count == 1, let selection = selections.first,
+              options.allSatisfy({ hasOption($0, in: selection.0) }),
+              screen.text.contains(where: { locationKey($0.0) == locationKey(item) && (0.81...0.90).contains($0.1.midY) })
+        else { return nil }
+        // Meituan puts the centered dismiss control between the selected-spec summary and the cart footer.
+        let dismissY = selection.1.midY - 0.14
+        guard (0.11...0.18).contains(dismissY), dismissY - button.1.midY > 0.04 else { return nil }
+        return (checkout, CGPoint(x: screen.bounds.midX, y: screen.bounds.minY + (1 - dismissY) * screen.bounds.height))
+    }
+
     private func specificationControl(_ tree: PhoneControlTree, item: String) -> PhoneControl? {
         let titles = tree.controls.indices.filter {
             tree.controls[$0].kind.hasSuffix("StaticText") && tree.controls[$0].texts.contains(item)
@@ -1286,7 +1323,7 @@ private final class PhonePickupPlan {
         guard task.quantity == 1 else { throw fail("本轮调试支持一杯，数量请在美团核对") }
         let permissions = native.prepare()
         defer {
-            if navigation?.mapURL != nil, !operation.isCancelled, !native.screenLocked(),
+            if (task.voiceRequest == true || navigation?.mapURL != nil), !operation.isCancelled, !native.screenLocked(),
                let bundle = Bundle.main.bundleIdentifier, native.frontApp()["bundleId"] as? String == appID {
                 if let error = native.app(bundle, action: "activate") {
                     NSLog("[knight-pickup] could not return to Knight after Meituan: %@", error)
@@ -1322,6 +1359,9 @@ private final class PhonePickupPlan {
             throw error
         }
         let (shop, store) = try chooseStore(located, place: place)
+        if let expected = task.expectedPickupStore, locationKey(store) != locationKey(expected) {
+            throw fail("续办时未找到原自提分店，请重新指定门店")
+        }
         if let future = shop.controls.compactMap({ futurePickupTime($0.label) }).first {
             throw fail("\(store)自取需\(future)后取餐")
         }
@@ -1371,40 +1411,80 @@ private final class PhonePickupPlan {
             }
         }
         let specTimeout = "美团未显示可核对的商品规格面板"
+        var visualCart: CGPoint?
         do {
             tree = try wait(timeoutMessage: specTimeout) {
                 ($0.controls.contains { self.locationKey($0.label) == self.locationKey(name) }) &&
                     self.has($0, "加入购物车") && $0.controls.contains { $0.label.hasPrefix("已选规格") }
             }
         } catch let stop as Stop where stop.message == fail(specTimeout).message {
-            if options.contains("无糖"), (try? hasOnlyNoAddedSugar(in: name)) == true {
-                throw fail("门店糖度提供不额外加糖、半糖和全糖，请确认是否接受不额外加糖")
+            if options.contains(where: { ["无糖", "不加糖"].contains($0) }),
+               (try? hasOnlyNoAddedSugar(in: name)) == true {
+                clarification = "no_added_sugar"
+                throw fail("门店提供不额外加糖、半糖和全糖，请告诉小布是否接受不额外加糖")
             }
-            throw stop
+            // The iPhone Debug build may receive an incomplete accessibility tree for this panel.
+            guard task.expectedPickupStore != nil,
+                  let point = try? visibleVerifiedCartPoint(item: name, options: options) else { throw stop }
+            tree = try read()
+            visualCart = point
         }
-        for option in options where !selected(tree, option: option) {
+        for option in options where visualCart == nil && !selected(tree, option: option) {
             var control = optionLabels(option).lazy.compactMap { self.find(tree, $0) }.first
             if control == nil && ["热", "冰", "加冰"].contains(option) {
                 let temperature = option == "加冰" ? "冰" : option
                 control = tree.unique { self.capture("[/／](\(temperature))[）)]$", in: $0.label) != nil }
             }
-            guard control != nil else { throw fail("门店没有可核对的「\(option)」选项") }
+            guard control != nil else {
+                if ["无糖", "不加糖"].contains(option), (try? hasOnlyNoAddedSugar(in: name)) == true {
+                    clarification = "no_added_sugar"
+                    throw fail("门店提供不额外加糖、半糖和全糖，请告诉小布是否接受不额外加糖")
+                }
+                throw fail("门店没有可核对的「\(option)」选项")
+            }
             try tap(control)
             tree = try wait { self.selected($0, option: option) }
         }
-        guard options.allSatisfy({ selected(tree, option: $0) }),
-              !tree.controls.contains(where: { capture("已添加\\s*([1-9][0-9]*)\\s*件商品", in: $0.label) != nil }) else { throw fail("请核对规格和现有购物车") }
+        guard visualCart != nil || options.allSatisfy({ selected(tree, option: $0) }),
+              ![shop, tree].contains(where: { page in
+                  has(page, "去结算") || page.controls.contains {
+                      capture("已添加\\s*([1-9][0-9]*)\\s*件商品", in: $0.label) != nil
+                  }
+              }) else { throw fail("美团已有购物车或规格无法核对") }
         phase = "核对自提结算"
-        try tap(find(tree, "加入购物车"))
-        tree = try wait { self.has($0, "去结算") }
-        try tap(find(tree, "去结算"))
-        do {
-            tree = try wait { $0.controls.contains { $0.label.contains("自取时间") } }
-        } catch {
-            tree = try read()
-            try tap(find(tree, "去结算"))
-            tree = try wait { $0.controls.contains { $0.label.contains("自取时间") } }
+        if let visualCart {
+            try tapPoint(visualCart)
+        } else {
+            try tap(find(tree, "加入购物车"))
         }
+        var checkoutPoint: CGPoint?
+        var dismissed = false
+        tree = try wait(timeoutMessage: "已选规格弹窗未收起或无法核对购物车", attempts: 8) { page in
+            if let visible = try? self.visibleCheckout(item: name, options: options) {
+                self.cartAdded = true
+                if let dismiss = visible.dismiss {
+                    if !dismissed {
+                        try self.tapPoint(dismiss)
+                        dismissed = true
+                    }
+                    return false
+                }
+                checkoutPoint = visible.button
+                return true
+            }
+            if visualCart == nil, self.find(page, "去结算") != nil,
+               !page.controls.contains(where: { $0.label.hasPrefix("已选规格") }) {
+                self.cartAdded = true
+                return true
+            }
+            return false
+        }
+        if let checkoutPoint {
+            try tapPoint(checkoutPoint)
+        } else {
+            try tap(find(tree, "去结算"))
+        }
+        tree = try wait { $0.controls.contains { $0.label.contains("自取时间") } }
         return try checkout(tree, store: store, query: query, options: options)
     }
 }

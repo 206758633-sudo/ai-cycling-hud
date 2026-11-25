@@ -55,7 +55,12 @@ python3 server/knight_orders.py --interface en0
 
 ## 验证状态
 
-iPhone 静默实测到库迪黄村新天地店的实时指引「67 米后右转」与蓝牙测试接收器一致。实体头显显示与实际骑行中的连续更新待验收。
+- 骑士内置高德地图覆盖导航、自提、自由骑行、个人轨迹与打卡。车队位置共享待接入。骑行实测曾用蓝牙测试接收器核对「67 米后右转」，实体双屏和实骑轨迹待验收。
+- 语音控屏显示小布自提任务的进展。核实结算后，小布播报门店、规格、价格和待付款状态。用户说「开始导航」后，骑士请求高德 GPS 骑行导航，并在 SDK 确认启动后更新回执。
+- 24 项订单测试及静默接口验证通过。结算弹窗修复已回放验证。新版小布固件的烧录、真实语音往返及这一版语音启动导航的真机联调待验收。
+- 车载屏能重组正常导航分片。异常分片序号校验待完善。
+
+[骑行地图](docs/changes/complete-cycling-maps/proposal.md) · [语音控屏](docs/changes/hands-free-voice-control/proposal.md) · [自提结算及语音启动导航](docs/changes/verify-voice-pickup-navigation/proposal.md)
 
 ```sh
 python3 -m unittest discover -s server

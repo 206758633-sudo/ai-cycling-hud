@@ -83,6 +83,8 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     private let pickupClaimKey = "knight.phone.pickup.claim"
     private let pickupReceiptKey = "knight.phone.pickup.receipt"
     private let pickupBluetooth = KnightPickupBluetooth()
+    private let rideVoiceLease = UUID().uuidString.lowercased()
+    private let rideReceiptKey = "knight.phone.ride.receipt"
 
     private struct PickupReceipt: Codable {
         let id: String
@@ -91,11 +93,27 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         let note: String?
         let quote: KnightPickupQuote?
         let navigation: KnightPickupPlace?
+        let clarification: String?
+        let cartAdded: Bool?
+        let voiceRequest: Bool?
+    }
+
+    private struct RideVoiceClaim: Decodable {
+        let id: String
+        let place: KnightPickupPlace
+    }
+
+    private struct RideVoiceReceipt: Codable {
+        let id: String
+        let lease: String
+        let state: String
+        let note: String
     }
 
     private struct PickupReceiptResponse: Decodable {
         let bluetoothReceipt: BluetoothReceipt?
         let pickupNavigation: KnightPickupPlace?
+        let voiceRequest: Bool?
 
         struct BluetoothReceipt: Decodable {
             let packet: Data
@@ -144,6 +162,8 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     private var rideHUDMessage: String?
     private var rideHUDWriting = false
     private var deliveredRideHUDMessage: String?
+    private var rideHUDExpiresAt: TimeInterval?
+    private var cyclingDestination: KnightMapPlace?
 
     private var rideKey: String? {
         guard KnightRideNavigation.sdkAvailable(),
@@ -175,7 +195,7 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         let phoneSearchEnabled = false
         #endif
         let nativeScript = WKUserScript(
-            source: "window.KnightOrdersEnabled = \(ordersConfig != nil); window.KnightPhoneSearchEnabled = \(phoneSearchEnabled); window.KnightRideNavigationEnabled = \(rideKey != nil); document.documentElement.classList.add('ios-native');",
+            source: "window.KnightOrdersEnabled = \(ordersConfig != nil); window.KnightPhoneSearchEnabled = \(phoneSearchEnabled); window.KnightRideNavigationEnabled = \(rideKey != nil); window.KnightNativeMaps = true; window.KnightVoiceControl = true; document.documentElement.classList.add('ios-native');",
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
@@ -226,6 +246,7 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         pushSafeAreaInsetsToWeb()
+        publishCyclingDestination()
         hudStateEvent(connected: false)
         #if DEBUG
         if !startedPhoneSearchProbe,
@@ -262,7 +283,8 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         case "hudConnect":
             startHudScan()
         case "hudSend":
-            if let text = body["data"] as? String { writeHud(text) }
+            if !(presentedViewController is KnightRideNavigation), !(presentedViewController is KnightCyclingMaps),
+               let text = body["data"] as? String { writeHud(text) }
         case "httpRequest":
             handleHTTPProxy(body)
         case "orderRequest":
@@ -276,6 +298,10 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
             let place = KnightPickupPlace(store: store, city: body["city"] as? String, address: body["address"] as? String)
             if action == "pickupRide" { showPickupRide(place) }
             else { requestPickupMap(place) }
+        case "cyclingPlace", "cyclingStart", "cyclingClear", "cyclingHistory", "cyclingCheckIns":
+            guard message.frameInfo.isMainFrame, message.frameInfo.request.url?.isFileURL == true,
+                  message.frameInfo.request.url?.lastPathComponent == "index.html" else { return }
+            handleCyclingMapAction(action)
         #if DEBUG
         case "phoneSearch":
             guard message.frameInfo.isMainFrame, message.frameInfo.request.url?.isFileURL == true,
@@ -334,7 +360,8 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
                     pickupBluetooth.enqueue(id: receipt.id, data: envelope.packet, expiresAt: envelope.expiresAt)
                 }
                 NSLog("[knight-pickup] phone receipt %@ %@", receipt.id, receipt.state)
-                if let place = response?.pickupNavigation ?? receipt.navigation {
+                if receipt.clarification == nil, (receipt.voiceRequest ?? response?.voiceRequest) != true,
+                   let place = response?.pickupNavigation ?? receipt.navigation {
                     requestPickupMap(place)
                 }
             }
@@ -343,10 +370,23 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     }
 
     private func pollPhonePickup() async {
-        guard UIApplication.shared.applicationState == .active, !pickupBusy,
-              !(presentedViewController is KnightRideNavigation) else { return }
+        guard UIApplication.shared.applicationState == .active, !pickupBusy else { return }
         pickupBusy = true
         let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: rideReceiptKey),
+           let receipt = try? JSONDecoder().decode(RideVoiceReceipt.self, from: data) {
+            await sendRideVoiceReceipt(receipt)
+            pickupBusy = false
+            return
+        }
+        guard presentedViewController == nil else {
+            pickupBusy = false
+            return
+        }
+        if await startClaimedVoiceRide() {
+            pickupBusy = false
+            return
+        }
         if let data = defaults.data(forKey: pickupReceiptKey), let receipt = try? JSONDecoder().decode(PickupReceipt.self, from: data) {
             await sendPickupReceipt(receipt)
             pickupBusy = false
@@ -365,10 +405,13 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
             pickupBusy = false
             return
         }
-        let fallback = PickupReceipt(id: task.id, lease: lease, state: "needs_input", note: "手机执行中断，请在美团核对购物车", quote: nil, navigation: nil)
+        let fallback = PickupReceipt(id: task.id, lease: lease, state: "needs_input", note: "手机执行中断，请在美团核对购物车", quote: nil, navigation: nil, clarification: nil, cartAdded: nil, voiceRequest: task.voiceRequest)
         defaults.set(try? JSONEncoder().encode(fallback), forKey: pickupReceiptKey)
         defaults.removeObject(forKey: pickupClaimKey)
         NSLog("[knight-pickup] claimed on iPhone %@", task.id)
+        if task.voiceRequest == true {
+            webView?.evaluateJavaScript("window.dispatchEvent(new Event('knight-voice-task'))", completionHandler: nil)
+        }
         if CBManager.authorization == .allowedAlways { startHudScan() }
         phoneSearch.startPickup(task) { [weak self] result in
             guard let self else { return }
@@ -376,15 +419,41 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
             switch result {
             case .ready(let quote, let navigation):
                 let place = KnightPickupPlace(store: quote.store, city: navigation?.city, address: quote.pickupAddress)
-                receipt = PickupReceipt(id: task.id, lease: lease, state: "pickup_checkout", note: nil, quote: quote, navigation: place)
-            case .stopped(let note, let navigation):
-                receipt = PickupReceipt(id: task.id, lease: lease, state: "needs_input", note: String(note.prefix(180)), quote: nil, navigation: navigation)
+                receipt = PickupReceipt(id: task.id, lease: lease, state: "pickup_checkout", note: nil, quote: quote, navigation: place, clarification: nil, cartAdded: true, voiceRequest: task.voiceRequest)
+            case .stopped(let note, let navigation, let clarification, let cartAdded):
+                receipt = PickupReceipt(id: task.id, lease: lease, state: "needs_input", note: String(note.prefix(180)), quote: nil, navigation: navigation, clarification: clarification, cartAdded: cartAdded, voiceRequest: task.voiceRequest)
                 NSLog("[knight-pickup] stopped %@", note)
             }
             defaults.set(try? JSONEncoder().encode(receipt), forKey: self.pickupReceiptKey)
             await self.sendPickupReceipt(receipt)
             self.pickupBusy = false
         }
+    }
+
+    private func startClaimedVoiceRide() async -> Bool {
+        guard let (data, status) = try? await pickupRequest("/api/delivery/phone/ride-claim", body: ["lease": rideVoiceLease]),
+              status == 200, let claim = try? JSONDecoder().decode(RideVoiceClaim.self, from: data) else { return false }
+        let report: (Bool, String) -> Void = { [weak self] started, detail in
+            guard let self else { return }
+            let receipt = RideVoiceReceipt(id: claim.id, lease: self.rideVoiceLease, state: started ? "active" : "failed",
+                                           note: String(detail.prefix(180)))
+            UserDefaults.standard.set(try? JSONEncoder().encode(receipt), forKey: self.rideReceiptKey)
+            Task { @MainActor in await self.sendRideVoiceReceipt(receipt) }
+        }
+        guard let key = rideKey, KnightRideNavigation.sdkAvailable(), claim.place.address?.isEmpty == false,
+              UIApplication.shared.applicationState == .active, presentedViewController == nil else {
+            report(false, "骑士未能打开已核对的取餐路线，请检查高德 SDK 和手机前台状态。")
+            return true
+        }
+        presentRide(name: claim.place.store, city: claim.place.city, address: claim.place.address, destination: nil,
+                    key: key, voiceStartResult: report)
+        return true
+    }
+
+    private func sendRideVoiceReceipt(_ receipt: RideVoiceReceipt) async {
+        guard let (_, status) = try? await pickupRequest("/api/delivery/tasks/\(receipt.id)/ride-result", body: receipt),
+              [200, 404, 409].contains(status) else { return }
+        UserDefaults.standard.removeObject(forKey: rideReceiptKey)
     }
     #endif
 
@@ -546,11 +615,13 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     private func openPendingPickupMap() {
         guard UIApplication.shared.applicationState == .active, !pickupMapOpening,
               !(presentedViewController is KnightRideNavigation),
+              !(presentedViewController is KnightCyclingMaps),
               let place = pendingPickupMap, let url = place.mapURL else { return }
         pendingPickupMap = nil
         activePickupMap = place
         rideHUDMessage = nil
         deliveredRideHUDMessage = nil
+        rideHUDExpiresAt = nil
         startHudScan()
         guard UIApplication.shared.canOpenURL(url) else {
             writeHud(place.hudMessage)
@@ -580,30 +651,92 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     }
 
     private func showPickupRide(_ place: KnightPickupPlace) {
-        guard presentedViewController == nil, UIApplication.shared.applicationState == .active else { return }
+        guard let key = keyForNewMap() else { return }
+        guard place.mapURL != nil else {
+            mapStatus("请先核对自提分店和取餐地址")
+            return
+        }
+        presentRide(name: place.store, city: place.city, address: place.address, destination: nil, key: key)
+    }
+
+    private func keyForNewMap() -> String? {
+        guard presentedViewController == nil, UIApplication.shared.applicationState == .active else { return nil }
         #if DEBUG
         guard !pickupBusy else {
-            mapStatus("美团自提任务正在执行，请稍后打开骑士导航")
-            return
+            cyclingMapNotice("美团自提任务正在执行，请稍后打开地图")
+            return nil
         }
         #endif
-        guard let key = rideKey, place.mapURL != nil else {
-            mapStatus("骑行导航暂不可用，请核对门店或在高德地图中打开")
+        guard let key = rideKey else {
+            cyclingMapNotice("地图暂不可用，请使用已配置高德 Key 的 iPhone 版本")
+            return nil
+        }
+        return key
+    }
+
+    private func cyclingMapNotice(_ text: String) {
+        webView?.evaluateJavaScript("window.dispatchEvent(new CustomEvent('knight-cycling-notice',{detail:\(jsEscape(text))}));")
+    }
+
+    private func handleCyclingMapAction(_ action: String) {
+        if action == "cyclingClear" {
+            cyclingDestination = nil
+            publishCyclingDestination()
             return
         }
+        guard let key = keyForNewMap() else { return }
+        if action == "cyclingStart", let place = cyclingDestination {
+            presentRide(name: place.name, city: nil, address: place.address, destination: place, key: key)
+            return
+        }
+        let mode: KnightCyclingMapMode
+        switch action {
+        case "cyclingPlace": mode = .destination
+        case "cyclingStart": mode = .freeRide
+        case "cyclingHistory": mode = .history
+        case "cyclingCheckIns": mode = .checkIns
+        default: return
+        }
+        if mode == .freeRide { startHudScan() }
+        let controller = KnightCyclingMaps(mode: mode, key: key, selection: { [weak self] place in
+            self?.cyclingDestination = place
+            self?.publishCyclingDestination()
+        }, guidance: { [weak self] turn, detail in
+            self?.updateRideHUD(turn: turn, detail: detail)
+        })
+        present(controller, animated: true)
+    }
+
+    private func publishCyclingDestination() {
+        let place = cyclingDestination
+        let details = place.map { "{name:\(jsEscape($0.name)),address:\(jsEscape($0.address))}" } ?? "null"
+        webView?.evaluateJavaScript("window.dispatchEvent(new CustomEvent('knight-cycling-destination',{detail:\(details)}));")
+    }
+
+    private func presentRide(name: String, city: String?, address: String?, destination: KnightMapPlace?, key: String,
+                             voiceStartResult: ((Bool, String) -> Void)? = nil) {
         startHudScan()
-        let controller = KnightRideNavigation(store: place.store, city: place.city, address: place.address, key: key) { [weak self] turn, detail in
+        updateRideHUD(turn: "路线规划", detail: "请看手机")
+        let controller = KnightRideNavigation(store: name, city: city, address: address, key: key) { [weak self] turn, detail in
             self?.updateRideHUD(turn: turn, detail: detail)
         }
+        controller.destination = destination
+        controller.voiceStartResult = voiceStartResult
         present(controller, animated: true)
     }
 
     private func updateRideHUD(turn: String, detail: String) {
         rideHUDMessage = "D:\(turn)|\(detail.isEmpty ? "导航中" : detail)"
+        rideHUDExpiresAt = detail.hasSuffix("米") || detail.hasSuffix("公里")
+            ? ProcessInfo.processInfo.systemUptime + 15 : nil
         sendLatestRideHUD()
     }
 
     private func sendLatestRideHUD() {
+        if let expiresAt = rideHUDExpiresAt, ProcessInfo.processInfo.systemUptime >= expiresAt {
+            rideHUDExpiresAt = nil
+            rideHUDMessage = "D:指引暂停|留意道路"
+        }
         guard !rideHUDWriting, hudPeripheral?.state == .connected, rxChar != nil,
               let message = rideHUDMessage, message != deliveredRideHUDMessage else { return }
         rideHUDWriting = true

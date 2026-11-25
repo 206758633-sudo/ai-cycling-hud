@@ -28,6 +28,61 @@ def pickup_frame(*labels):
 
 
 class PickupTests(unittest.TestCase):
+    def test_pickup_ride_requires_verified_checkout_and_explicit_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'orders.sqlite3'
+            initialize(path)
+            with contextlib.closing(database(path)) as db:
+                _, order = delivery.enqueue(db, 'device', dict(PICKUP_PLAN, request_id='voice_ride_order_a'))
+                task_id = order['id']
+                order_lease = 'pickup-ride-order-lease'
+                phone_lease = 'pickup-ride-phone-lease'
+                delivery.claim_phone_task(db, {'lease': order_lease})
+                with self.assertRaisesRegex(delivery.DeliveryError, 'verified_pickup_required'):
+                    delivery.request_pickup_ride(db, task_id)
+                place = dict(store='示例咖啡（测试店）', city='深圳市')
+                quote = dict(store=place['store'], pickup_address='深圳市南山区示例路1号',
+                             item='热美式（不加糖）', quantity=1, total_cents=830)
+                delivery.finish_phone_task(db, task_id, dict(state='pickup_checkout', lease=order_lease,
+                                                             navigation=place, quote=quote, cart_added=True))
+                self.assertIn('请说开始导航', delivery.pickup_voice_feedback(db, task_id))
+                self.assertIsNone(delivery.claim_pickup_ride(db, {'lease': phone_lease})[1])
+                delivery.confirm_voice_pickup(db, task_id)
+                self.assertIsNone(delivery.claim_pickup_ride(db, {'lease': phone_lease})[1])
+                self.assertEqual(delivery.request_pickup_ride(db, task_id)[0], 201)
+                self.assertEqual(delivery.request_pickup_ride(db, task_id)[0], 200)
+                _, claimed = delivery.claim_pickup_ride(db, {'lease': phone_lease})
+                self.assertEqual(claimed['place'], {**place, 'address': quote['pickup_address']})
+                self.assertIsNone(delivery.pickup_ride_feedback(db, task_id))
+                self.assertIsNone(delivery.claim_pickup_ride(db, {'lease': 'another-iphone-lease'})[1])
+                with self.assertRaisesRegex(delivery.DeliveryError, 'pickup_ride_lease_invalid'):
+                    delivery.finish_pickup_ride(db, task_id, {'lease': 'another-iphone-lease', 'state': 'active'})
+                failed = dict(lease=phone_lease, state='failed', note='无法定位')
+                delivery.finish_pickup_ride(db, task_id, failed)
+                self.assertIn('未启动', delivery.pickup_ride_feedback(db, task_id)['text'])
+                self.assertEqual(delivery.request_pickup_ride(db, task_id)[0], 201)
+                delivery.claim_pickup_ride(db, {'lease': phone_lease})
+                delivery.finish_pickup_ride(db, task_id, {'lease': phone_lease, 'state': 'active'})
+                self.assertEqual(delivery.pickup_ride_feedback(db, task_id)['state'], 'active')
+                self.assertIn('GPS 骑行导航已启动', delivery.list_tasks(db)['tasks'][0]['ride_note'])
+
+    def test_cart_only_receipt_does_not_offer_navigation_or_payment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'orders.sqlite3'
+            initialize(path)
+            with contextlib.closing(database(path)) as db:
+                _, order = delivery.enqueue(db, 'device', dict(PICKUP_PLAN, request_id='voice_ride_cart_only'))
+                lease = 'cart-before-checkout-lease'
+                delivery.claim_phone_task(db, {'lease': lease})
+                delivery.finish_phone_task(db, order['id'], dict(state='needs_input', lease=lease, cart_added=True,
+                                                                  note='购物车页面待核对'))
+                text = delivery.pickup_voice_feedback(db, order['id'])
+                self.assertIn('商品已加购', text)
+                self.assertNotIn('请说开始导航', text)
+                self.assertNotIn('请在美团核对后付款', text)
+                with self.assertRaisesRegex(delivery.DeliveryError, 'verified_pickup_required'):
+                    delivery.request_pickup_ride(db, order['id'])
+
     def test_phone_claim_is_exclusive_and_reports_manual_checkout(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'orders.sqlite3'
@@ -127,6 +182,63 @@ class PickupTests(unittest.TestCase):
                 _, finished = delivery.finish_phone_task(db, task['id'], dict(result, navigation=place))
                 self.assertEqual(finished['pickup_navigation'], place)
                 self.assertIsNone(finished['quote'])
+
+    def test_voice_clarification_resumes_once_with_original_pickup_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'orders.sqlite3'
+            initialize(path)
+            with database(path) as db:
+                original_fields = dict(PICKUP_PLAN, query='橙C咖啡', merchant='库迪',
+                                       options='无糖、加冰、大杯', request_id='voice_clarification_a')
+                _, original = delivery.enqueue(db, 'device', original_fields)
+                lease = 'phone-voice-lease-a'
+                delivery.claim_phone_task(db, {'lease': lease})
+                place = {'store': '库迪咖啡（测试店）', 'city': '深圳市'}
+                result = {'state': 'needs_input', 'lease': lease, 'navigation': place,
+                          'note': '请说出糖度', 'clarification': 'no_added_sugar'}
+                with self.assertRaisesRegex(delivery.DeliveryError, 'invalid_pickup_clarification'):
+                    delivery.finish_phone_task(db, original['id'], {**result, 'navigation': None})
+                delivery.finish_phone_task(db, original['id'], result)
+                self.assertIn('你接受不额外加糖吗', delivery.pickup_voice_feedback(db, original['id']))
+                reply = {'request_id': 'voice_clarification_reply', 'selection': '不额外加糖'}
+                with self.assertRaisesRegex(delivery.DeliveryError, 'invalid_pickup_selection'):
+                    delivery.continue_voice_pickup(db, original['id'], {**reply, 'selection': '同意'})
+                status, resumed = delivery.continue_voice_pickup(db, original['id'], reply)
+                self.assertEqual(status, 201)
+                self.assertNotEqual(resumed['id'], original['id'])
+                self.assertEqual(resumed['state'], 'queued')
+                self.assertEqual(resumed['options'], '不额外加糖、加冰、大杯')
+                for field in ('query', 'merchant', 'quantity', 'budget_cents', 'pickup_destination'):
+                    self.assertEqual(resumed[field], original_fields[field])
+                self.assertEqual(resumed['resumed_from'], original['id'])
+                self.assertTrue(resumed['voice_request'])
+                self.assertEqual(delivery.continue_voice_pickup(db, original['id'], reply)[1]['id'], resumed['id'])
+                with self.assertRaisesRegex(delivery.DeliveryError, 'pickup_clarification_unavailable'):
+                    delivery.continue_voice_pickup(db, original['id'], {**reply, 'request_id': 'voice_clarification_other'})
+                _, claimed = delivery.claim_phone_task(db, {'lease': 'phone-voice-lease-b'})
+                self.assertEqual(claimed['expected_pickup_store'], place['store'])
+                self.assertIsNone(claimed['quote'])
+                self.assertEqual(delivery.task(db, original['id'])['state'], 'reviewed')
+
+    def test_voice_clarification_expires_and_legacy_stop_never_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'orders.sqlite3'
+            initialize(path)
+            with database(path) as db:
+                _, original = delivery.enqueue(db, 'device', dict(PICKUP_PLAN, request_id='voice_clarification_expire'))
+                lease = 'phone-voice-lease-c'
+                delivery.claim_phone_task(db, {'lease': lease})
+                result = {'state': 'needs_input', 'lease': lease, 'navigation': {'store': '测试店', 'city': '深圳市'}}
+                delivery.finish_phone_task(db, original['id'], result)
+                reply = {'request_id': 'voice_clarification_expired', 'selection': '不额外加糖'}
+                with self.assertRaisesRegex(delivery.DeliveryError, 'pickup_clarification_unavailable'):
+                    delivery.continue_voice_pickup(db, original['id'], reply)
+                with db:
+                    db.execute("UPDATE delivery_tasks SET clarification='no_added_sugar', updated_at=0 WHERE id=?",
+                               (original['id'],))
+                self.assertIn('已过期', delivery.pickup_voice_feedback(db, original['id']))
+                with self.assertRaisesRegex(delivery.DeliveryError, 'pickup_clarification_unavailable'):
+                    delivery.continue_voice_pickup(db, original['id'], reply)
 
     def test_native_address_picker_switches_city_and_confirms_the_exact_poi(self):
         def frame(*controls):

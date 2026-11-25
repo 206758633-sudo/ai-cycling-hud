@@ -32,7 +32,7 @@ REQUEST_ID = re.compile(r'[a-zA-Z0-9_-]{16,80}')
 INTENT_PATH = re.compile(r'/api/orders/intents/([a-f0-9]{32})/decision')
 MAX_BODY = 4096
 MAX_VOICE_AUDIO = 128 * 1024
-VOICE_FEEDBACK_WAIT = 24
+VOICE_FEEDBACK_WAIT = 55
 ORDER_VIEW = '''SELECT i.id, i.sku, i.item, i.quantity, i.unit_cents, i.state,
                        i.created_at, o.number AS order_number
                 FROM intents i LEFT JOIN orders o ON o.intent_id = i.id'''
@@ -256,6 +256,9 @@ class OrdersHandler(BaseHTTPRequestHandler):
         voice_feedback_path = delivery.VOICE_FEEDBACK_PATH.fullmatch(path)
         voice_feedback_text_path = delivery.VOICE_FEEDBACK_TEXT_PATH.fullmatch(path)
         voice_pickup_confirm_path = delivery.VOICE_PICKUP_CONFIRM_PATH.fullmatch(path)
+        voice_pickup_continue_path = delivery.VOICE_PICKUP_CONTINUE_PATH.fullmatch(path)
+        voice_ride_path = delivery.VOICE_RIDE_PATH.fullmatch(path)
+        phone_ride_result_path = delivery.PHONE_RIDE_RESULT_PATH.fullmatch(path)
         spoken_feedback = None
         try:
             with closing(database(self.server.db_path)) as db:
@@ -305,6 +308,30 @@ class OrdersHandler(BaseHTTPRequestHandler):
                 elif method == 'POST' and voice_pickup_confirm_path:
                     self.authorize('device')
                     result = delivery.confirm_voice_pickup(db, voice_pickup_confirm_path[1])
+                elif method == 'POST' and voice_pickup_continue_path:
+                    self.authorize('device')
+                    result = delivery.continue_voice_pickup(db, voice_pickup_continue_path[1], self.body())
+                    self.server.delivery_wakeup.set()
+                elif voice_ride_path:
+                    self.authorize('device')
+                    task_id = voice_ride_path[1]
+                    if method == 'POST':
+                        result = delivery.request_pickup_ride(db, task_id)
+                    else:
+                        deadline = time.monotonic() + (VOICE_FEEDBACK_WAIT if url.query == 'wait=1' else 0)
+                        while True:
+                            feedback = delivery.pickup_ride_feedback(db, task_id)
+                            remaining = deadline - time.monotonic()
+                            if feedback is not None or remaining <= 0:
+                                break
+                            time.sleep(min(0.35, remaining))
+                        result = (Status.NO_CONTENT, None) if feedback is None else (Status.OK, feedback)
+                elif method == 'POST' and path == '/api/delivery/phone/ride-claim':
+                    self.authorize('phone')
+                    result = delivery.claim_pickup_ride(db, self.body())
+                elif method == 'POST' and phone_ride_result_path:
+                    self.authorize('phone')
+                    result = delivery.finish_pickup_ride(db, phone_ride_result_path[1], self.body())
                 elif method == 'POST' and path == '/api/delivery/tasks':
                     self.authorize('phone')
                     result = delivery.enqueue(db, 'phone', self.body())

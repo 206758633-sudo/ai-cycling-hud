@@ -19,6 +19,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 constexpr char kTag[] = "KnightOrders";
@@ -52,7 +53,7 @@ std::string ReadBluetoothReceipt(const std::string& task_id, bool wait, std::str
         return false;
     };
     if (wait) {
-        receipts_changed.wait_for(lock, std::chrono::seconds(24), find_receipt);
+        receipts_changed.wait_for(lock, std::chrono::seconds(55), find_receipt);
     } else {
         find_receipt();
     }
@@ -61,12 +62,18 @@ std::string ReadBluetoothReceipt(const std::string& task_id, bool wait, std::str
 
 std::string SpokenFeedback(const std::string& text, const std::string& task_id) {
     const bool checkout = text.rfind("美团自提结算页已就绪。", 0) == 0;
+    const bool sugar_question = text.rfind("这家门店只有不额外加糖、半糖和全糖。", 0) == 0;
     {
         std::lock_guard<std::mutex> lock(receipts_mutex);
         reported_checkout_id = checkout && task_id.size() == 32 ? task_id : std::string();
+        if (sugar_question && task_id.size() == 32) latest_pickup_id = task_id;
     }
     if (checkout) {
-        return "请用当前音色简洁播报骑士回执，保留门店、商品规格、金额和待付款状态，随后等待用户确认或提出修改。" + text;
+        return "请用当前音色简洁播报骑士的实际结算回执，保留门店、品项、金额和待付款状态。"
+               "只有播报后听到用户明确说开始导航，才调用 start_pickup_ride。" + text;
+    }
+    if (sugar_question) {
+        return "请直接读出这个问题，等待用户用语音答复。只有用户明确接受不额外加糖时才调用 continue_meituan_pickup。" + text;
     }
     return "请用当前音色播报骑士的实际处理结果。" + text;
 }
@@ -84,7 +91,7 @@ std::string PickupFeedback(const std::string& task_id, bool wait) {
     }
     wait = wait && !wait_on_bluetooth;
     auto http = Board::GetInstance().GetNetwork()->CreateHttp();
-    http->SetTimeout(wait ? 28000 : 2500);
+    http->SetTimeout(wait ? 59000 : 2500);
     http->SetHeader("Authorization", "Bearer " KNIGHT_ORDERS_DEVICE_TOKEN);
     const auto url = std::string(KNIGHT_DELIVERY_ENDPOINT) + "/" + task_id +
                      "/feedback-text" + (wait ? "?wait=1" : "");
@@ -130,6 +137,45 @@ std::string ConfirmPickupFeedback() {
     if (status != 200) return "暂时无法记录你的确认，请在美团核对。";
     return "已记录这笔自提的语音确认，请在手机美团核对并付款。";
 }
+
+std::string PickupRide(bool request_start) {
+    std::string id;
+    {
+        std::lock_guard<std::mutex> lock(receipts_mutex);
+        id = reported_checkout_id;
+    }
+    if (id.empty()) return "请先说播报我的自提结果，核对取餐门店和结算后再开始导航。";
+    const auto endpoint = std::string(KNIGHT_DELIVERY_ENDPOINT) + "/" + id + "/ride";
+    auto request = [&](bool post) {
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp();
+        http->SetTimeout(post ? 3000 : 59000);
+        http->SetHeader("Authorization", "Bearer " KNIGHT_ORDERS_DEVICE_TOKEN);
+        if (post) {
+            http->SetHeader("Content-Type", "application/json");
+            http->SetContent("{}");
+        }
+        if (!http->Open(post ? "POST" : "GET", post ? endpoint : endpoint + "?wait=1")) {
+            return std::pair<int, std::string>{0, {}};
+        }
+        const auto status = http->GetStatusCode();
+        auto response = http->ReadAll();
+        http->Close();
+        return std::make_pair(status, std::move(response));
+    };
+    if (request_start) {
+        const auto [status, response] = request(true);
+        if (status == 409) return "当前没有在有效期内的已核实自提结算，导航没有启动。";
+        if (status != 200 && status != 201) return "骑士没有确认接收导航请求。你可以说查询导航状态。";
+    }
+    const auto [status, response] = request(false);
+    if (status == 204) return "骑士还没有确认导航启动。你可以说查询导航状态。";
+    if (status == 404) return "还没有这笔自提的导航启动请求。";
+    if (status != 200) return "暂时无法查询高德导航状态。";
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> json(cJSON_Parse(response.c_str()), cJSON_Delete);
+    const auto* text = cJSON_GetObjectItemCaseSensitive(json.get(), "text");
+    if (!cJSON_IsString(text)) return "没有收到可核对的高德导航状态。";
+    return std::string("请按骑士回执用当前音色回答，不提前声称导航已启动。") + text->valuestring;
+}
 #endif
 
 std::string GenerateRequestID() {
@@ -158,7 +204,7 @@ std::string SubmitIntent(const char* endpoint, std::string body, bool delivery, 
         if (status != 200 && status != 201) {
             ESP_LOGW(kTag, "Intent rejected (HTTP %d)", status);
             if (delivery && status == 409) {
-                throw std::runtime_error("已有待处理的美团任务，请先在骑士 App 核对");
+                throw std::runtime_error("已有待处理任务，或当前任务已不能续办。可以说播报我的自提结果");
             }
             throw std::runtime_error("Mac 未接受点单请求，请检查服务和请求内容");
         }
@@ -187,7 +233,7 @@ std::string SubmitIntent(const char* endpoint, std::string body, bool delivery, 
         }
         return "这一笔测试点单请求已处理，请到骑士 App 查看状态。";
     }
-    throw std::runtime_error("无法确认 Mac 收到请求，请先在骑士 App 检查待确认列表");
+    throw std::runtime_error("无法确认骑士服务收到请求。请先说播报我的自提结果，避免重复提交");
 }
 std::string SubmitAmericano(int quantity) {
     const auto body = "{\"sku\":\"hot-americano\",\"quantity\":" + std::to_string(quantity) +
@@ -258,6 +304,19 @@ std::string SubmitDelivery(const DeliveryRequest& request) {
     if (pickup) return result;
     return SummarizeDelivery(request) + result;
 }
+
+std::string ContinuePickup(const std::string& selection) {
+    if (selection != "不额外加糖") return "没有改变订单。若你接受该规格，请明确说可以，就不额外加糖。";
+    std::string id;
+    {
+        std::lock_guard<std::mutex> lock(receipts_mutex);
+        id = latest_pickup_id;
+    }
+    if (id.size() != 32) return "还未核对到等待答复的任务。你可以先说播报我的自提结果。";
+    const auto endpoint = std::string(KNIGHT_DELIVERY_ENDPOINT) + "/" + id + "/continue-pickup";
+    const auto body = "{\"selection\":\"不额外加糖\",\"request_id\":\"" + GenerateRequestID() + "\"}";
+    return SubmitIntent(endpoint.c_str(), body, true, true);
+}
 #endif
 } // namespace
 #endif
@@ -301,7 +360,7 @@ bool ReceiveKnightPickupFeedback(const uint8_t* packet, size_t size) {
 void InitializeKnightOrders() {
 #if defined(KNIGHT_ORDERS_CONFIGURED)
     McpServer::GetInstance().AddTool("self.knight_orders.request_americano",
-        "当用户明确要求在骑士驿站点热美式时，提交本地测试点单请求，并提示用户到骑士 App 确认。",
+        "仅供开发联调，当用户明确说运行驿站测试订单时使用。真实点单请用美团工具。",
         PropertyList({Property("quantity", kPropertyTypeInteger, 1, 1, 5)}),
         [](const PropertyList& args) -> ReturnValue {
             return SubmitAmericano(args["quantity"].value<int>());
@@ -321,7 +380,8 @@ void InitializeKnightOrders() {
         });
     mcp.AddTool("self.knight_orders.prepare_meituan_pickup",
         "当用户要求在骑行目的地附近点咖啡到店自提时使用。把对话中用户已明确的目的地原文放进 pickup_destination。"
-        "没说清地点或商品就先追问，保留明确的糖度、温度和预算。用当前对话音色读回工具的实际结果，用户在美团结算页提交付款。",
+        "没说清地点或商品就用语音追问。按用户明确说出的商品、数量、门店、糖度、温度和预算直接准备。"
+        "默认无需用户再次确认或在手机输入。用当前对话音色读回实际结果，最终由用户在美团付款。",
         DeliveryProperties(true), [](const PropertyList& args) -> ReturnValue {
             const auto request = ReadDeliveryRequest(args);
             if (request.pickup_destination.find_first_not_of(" \t\r\n") == std::string::npos) {
@@ -329,17 +389,30 @@ void InitializeKnightOrders() {
             }
             return SubmitDelivery(request);
         });
+    mcp.AddTool("self.knight_orders.continue_meituan_pickup",
+        "仅在上一笔真实自提回执明确询问是否接受不额外加糖，而且用户已明确接受这一选项时调用。"
+        "传入原文规格不额外加糖。拒绝、含糊答复或其他规格不调用本工具。成功后继续原任务，保留其他字段并播报实际回执。",
+        PropertyList({Property("selection", kPropertyTypeString)}), [](const PropertyList& args) -> ReturnValue {
+            return ContinuePickup(args["selection"].value<std::string>());
+        });
     mcp.AddTool("self.knight_orders.get_pickup_feedback",
         "当用户想听上一笔美团自提结果时使用。只查询并播报，保留回执中的商品、金额和付款状态。",
         PropertyList(), [](const PropertyList&) -> ReturnValue {
             return PickupFeedback("latest", false);
         });
     mcp.AddTool("self.knight_orders.confirm_pickup_feedback",
-        "仅当用户明确确认刚播报的美团自提结果时调用。核对结算是否就绪，提醒在美团付款。"
-        "用户想重听时用 get_pickup_feedback。用户要求修改时先复述需要修改的字段并等待用户明确要求重新查找。",
+        "用户主动对已经就绪的结算回执表示确认时可调用。确认只记录结果，付款仍在美团完成。"
+        "遇到糖度追问时应按回执使用 continue_meituan_pickup。",
         PropertyList(), [](const PropertyList&) -> ReturnValue {
             return ConfirmPickupFeedback();
         });
+    mcp.AddTool("self.knight_orders.start_pickup_ride",
+        "只有已播报实际自提结算回执，且用户明确说开始导航或导航去该取餐门店时调用。"
+        "普通好的、确认订单、播报结果均不调用。根据工具回执答复是否确实启动。",
+        PropertyList(), [](const PropertyList&) -> ReturnValue { return PickupRide(true); });
+    mcp.AddTool("self.knight_orders.get_pickup_ride_status",
+        "用户询问刚才的自提骑行导航是否已启动时，查询实际 GPS 状态。",
+        PropertyList(), [](const PropertyList&) -> ReturnValue { return PickupRide(false); });
 #endif
 #endif
 }

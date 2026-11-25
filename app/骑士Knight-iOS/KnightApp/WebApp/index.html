@@ -1454,8 +1454,28 @@ const tmm = id => S.team.m[id] || 'off';
 const tmIn = () => TM.filter(x => tmm(x.id) === 'in');
 const teamOn = () => S.team.saved && tmIn().length > 0;
 
+let nativeCyclingDestination = null;
+
+function sendCyclingMapAction(action) {
+  window.webkit?.messageHandlers?.knightNative?.postMessage({action});
+}
+
+window.addEventListener('knight-cycling-destination', event => {
+  nativeCyclingDestination = event.detail;
+  render(false);
+});
+window.addEventListener('knight-cycling-notice', event => toast(event.detail));
+
 function rideLogBodyHTML() {
   const t = S.logTab, st = S.stats;
+  if (window.KnightNativeMaps && t !== 'crew') {
+    const checkIn = t === 'check';
+    return `<div class="panel-in">
+      <button class="btn" type="button" data-act="${checkIn ? 'cyclingCheckIns' : 'cyclingHistory'}">
+        ${ic(checkIn ? 'pin' : 'route', 16)}${checkIn ? '打开打卡地图' : '查看骑行轨迹'}
+      </button>
+    </div>`;
+  }
   if (t === 'me') {
     const latest = S.rides[0];
     return `<div class="panel-in" style="display:grid;gap:7px"><div class="stat3">
@@ -1541,7 +1561,9 @@ function homeCrewHTML() {
 }
 
 function rideHomeHTML() {
-  const sp = S.destIdx != null ? SPOTS[S.destIdx] : null;
+  const sp = window.KnightNativeMaps
+    ? nativeCyclingDestination
+    : S.destIdx != null ? SPOTS[S.destIdx] : null;
   return `<div class="pg">
     <div class="scroll">
       <div class="top-hd rise">
@@ -1582,16 +1604,18 @@ function rideHomeHTML() {
           <span class="dest-ic">${ic('search', 15, 2.2)}</span>
           <div class="dest-t">
             <b>${sp ? esc(sp.name) : '自由骑行（不设终点）'}</b>
-            <small>${sp ? esc(sp.sub) : '自动记录轨迹并同步路途打卡点'}</small>
+            <small>${sp ? esc(sp.address || sp.sub || '已选地点') : '记录本次骑行轨迹'}</small>
           </div>
           <span style="font-size:12px;font-weight:740;color:var(--gold)">切换 ›</span>
         </button>
         <button class="btn dark" style="min-height:46px;font-size:15px" type="button" data-act="startRide">
-          ${ic('ride', 18)}${teamOn() ? `全队一起出发 · ${tmIn().length + 1} 人` : (sp ? '开始导航骑行' : '开始自由骑行')}
+          ${ic('ride', 18)}${window.KnightNativeMaps
+            ? (sp ? '查看骑行路线' : '开始自由骑行')
+            : teamOn() ? `全队一起出发 · ${tmIn().length + 1} 人` : (sp ? '开始导航骑行' : '开始自由骑行')}
         </button>
       </div>
     </div>
-    ${S.riding ? ridingOverlayHTML() : ''}
+    ${!window.KnightNativeMaps && S.riding ? ridingOverlayHTML() : ''}
   </div>`;
 }
 
@@ -1643,6 +1667,10 @@ function ridingOverlayHTML() {
 
 let navTimer = null;
 function startRide() {
+  if (window.KnightNativeMaps) {
+    sendCyclingMapAction('cyclingStart');
+    return;
+  }
   playFx('route', .32);
   playVoice('前方三百米，连续右弯，请留意路况。');
   S.riding = { dist:280, spd:42, mx:115, my:420, t:0, hud1:'↱ 280m', hud2:'右转弯道', sub:'实时投射导航转向' };
@@ -2129,6 +2157,13 @@ async function refreshDelivery() {
 }
 
 function showDelivery(query = '') {
+  if (window.KnightVoiceControl) {
+    if ($('#sheet').classList.contains('on')) closeSheet();
+    S.tab = 'ctrl';
+    render(false);
+    void refreshVoiceControl();
+    return;
+  }
   openSheet(`<div id="knightDelivery"><div class="row"><h2>美团点单</h2>
     <button class="btn sm" type="button" data-act="deliveryRefresh">刷新</button></div>
     <p data-delivery-status role="status">正在连接 Mac…</p>
@@ -2191,6 +2226,10 @@ window.addEventListener('knight-phone-search', event => {
 if (orderBackend) document.addEventListener('visibilitychange', () => { void refreshDelivery(); });
 
 function startAiTask(kind, custom) {
+  if (window.KnightVoiceControl) {
+    showDelivery();
+    return;
+  }
   if (kind === 'coffee' && orderBackend) return showKnightOrders();
   if (S.riding) { clearInterval(navTimer); S.riding = null; hideBanner(); }
   if (S.tab !== 'ctrl') { S.tab = 'ctrl'; render(true); }
@@ -2201,7 +2240,91 @@ function startAiTask(kind, custom) {
   else guard(runCtrlWx(r, custom));
 }
 
+let voiceControlTasks = [];
+let voiceControlStatus = orderBackend ? '等待小布的语音请求' : '等待连接订单服务';
+let voiceControlReading = false;
+
+function voiceControlCards(tasks) {
+  const replaced = new Set(tasks.map(task => task.resumed_from).filter(Boolean));
+  return tasks.filter(task => task.voice_request && task.pickup_destination && !replaced.has(task.id)).slice(0, 8).map(task => {
+    const sugarQuestion = task.state === 'needs_input' && task.clarification === 'no_added_sugar';
+    const status = sugarQuestion ? (task.expires_in <= 0 ? '答复已过期' : '等待语音答复')
+      : task.expires_in <= 0 && ['queued', 'preparing', 'pickup_checkout'].includes(task.state) ? '任务已过期'
+      : ({queued:'已接收', preparing:'正在美团核对', pickup_checkout:'结算已就绪 · 待付款',
+        needs_input:task.cart_added ? '已加购 · 结算待核对' : '本次未完成',
+        reviewed:'已确认回执', cancelled:'已取消'})[task.state] || '状态待同步';
+    const quote = task.quote;
+    const store = quote?.store || task.pickup_navigation?.store || task.merchant;
+    const canPay = task.state === 'pickup_checkout' && task.expires_in > 0;
+    const instruction = sugarQuestion
+      ? task.expires_in <= 0 ? '请对小布重新说自提需求。' : '若接受，请对小布说「可以，就不额外加糖」。'
+      : canPay ? '请停稳后在美团付款。需要导航时，对小布说「开始导航」。' : '';
+    return `<section class="panel" style="margin:0 0 10px"><div class="panel-in">
+      <small style="display:block;margin-bottom:5px;color:var(--sub)">${esc(status)}</small>
+      <b>${esc(quote?.item || task.query)} × ${esc(quote?.quantity ?? task.quantity)}</b>
+      ${store ? `<p>门店 ${esc(store)}</p>` : ''}
+      ${quote?.pickup_address ? `<p>取餐地址 ${esc(quote.pickup_address)}</p>` : `<p>自提目的地 ${esc(task.pickup_destination)}</p>`}
+      ${!quote && task.options ? `<p>规格 ${esc(task.options)}</p>` : ''}
+      ${quote && Number.isInteger(quote.total_cents) ? `<p><b>${canPay ? '待付' : '结算金额'} ¥${(quote.total_cents / 100).toFixed(2)}</b></p>` : ''}
+      ${task.note && task.state !== 'pickup_checkout' ? `<p>${esc(task.note)}</p>` : ''}
+      ${task.ride_note ? `<p>${esc(task.ride_note)}</p>` : ''}
+      ${instruction ? `<p>${esc(instruction)}</p>` : ''}
+    </div></section>`;
+  }).join('');
+}
+
+async function refreshVoiceControl() {
+  const cards = $('#voiceControlCards');
+  if (!window.KnightVoiceControl || !orderBackend || !cards || document.hidden || voiceControlReading) return;
+  voiceControlReading = true;
+  try {
+    const result = await requestOrder('deliveryList');
+    if (!Array.isArray(result.tasks)) throw new Error('语音任务暂不可用');
+    voiceControlTasks = result.tasks;
+    voiceControlStatus = voiceControlCards(voiceControlTasks) ? '最近语音任务' : '等待小布的语音请求';
+  } catch {
+    voiceControlStatus = '订单服务暂未连接，正在重试';
+  } finally {
+    voiceControlReading = false;
+  }
+  const liveCards = $('#voiceControlCards');
+  const status = $('#voiceControlStatus');
+  if (!liveCards || !status) return;
+  const html = voiceControlCards(voiceControlTasks);
+  if (liveCards.dataset.rendered !== html) {
+    liveCards.innerHTML = html;
+    liveCards.dataset.rendered = html;
+  }
+  if (status.textContent !== voiceControlStatus) status.textContent = voiceControlStatus;
+}
+
+if (window.KnightVoiceControl && orderBackend) {
+  window.addEventListener('knight-voice-task', () => showDelivery());
+  setInterval(() => { void refreshVoiceControl(); }, 1800);
+  document.addEventListener('visibilitychange', () => { void refreshVoiceControl(); });
+}
+
+function voiceControlHTML() {
+  return `<div class="pg"><div class="scroll">
+    <div class="ctrl-hd" style="padding-bottom:10px"><div class="hd-inline"><h1>语音控屏</h1></div></div>
+    <section class="panel" style="margin:0 14px 18px">
+      <div class="panel-in" style="padding:18px;display:grid;gap:10px">
+        <b style="font-size:18px">你好小布</b>
+        <p>例如说「在黄村地铁站 B 口附近，点一杯橙 C 咖啡，到店自提」。</p>
+        <small style="color:var(--sub)">${window.KnightPhoneSearchEnabled
+          ? '小布会用语音追问并播报结果。骑士在前台时可以执行点单。'
+          : '这里显示小布语音任务。此版本未启用手机端美团执行。'}</small>
+      </div>
+    </section>
+    <div style="margin:0 14px">
+      <p id="voiceControlStatus" role="status" style="margin:0 0 8px;color:var(--sub)">${esc(voiceControlStatus)}</p>
+      <div id="voiceControlCards">${voiceControlCards(voiceControlTasks)}</div>
+    </div>
+  </div></div>`;
+}
+
 function ctrlTabHTML() {
+  if (window.KnightVoiceControl) return voiceControlHTML();
   const logH = S.ai.log.map(e => typeof e === 'string' ? e : `<div id="${e.op.id}">${(PARTS[e.op.id] = () => opCardHTML(e.op))()}</div>`).join('');
   return `<div class="pg">
     <div class="ctrl-hd">
@@ -2439,8 +2562,11 @@ function meTabHTML() {
         <span class="me-edit-pill">${A.loggedIn ? '账号管理' : '去登录'}${ic('chev', 12)}</span>
       </button>
       <div class="me-stats">
+        ${window.KnightNativeMaps ? `
+        <button class="me-st me-st-btn" type="button" data-act="cyclingHistory"><b>${ic('route', 22)}</b><span>骑行轨迹</span></button>
+        <button class="me-st me-st-btn" type="button" data-act="cyclingCheckIns"><b>${ic('pin', 22)}</b><span>打卡地图</span></button>` : `
         <button class="me-st me-st-btn" type="button" data-act="openRideStats" data-arg="me"><b>${st.meKm}<small>km</small></b><span>本月里程</span></button>
-        <button class="me-st me-st-btn" type="button" data-act="openRideStats" data-arg="me"><b>${st.meTrips}<small>趟</small></b><span>累计骑行</span></button>
+        <button class="me-st me-st-btn" type="button" data-act="openRideStats" data-arg="me"><b>${st.meTrips}<small>趟</small></b><span>累计骑行</span></button>`}
         <div class="me-st"><b>2<small>台</small></b><span>在线设备</span></div>
       </div>
     </div>
@@ -2687,6 +2813,7 @@ const ACT = {
     upd('rideLog');
   },
   toggleCheckin: i => {
+    if (window.KnightNativeMaps) return sendCyclingMapAction('cyclingCheckIns');
     const c = S.checkins[+i]; if (!c) return;
     if (!c.done) {
       c.done = true; c.sub = '刚刚 · 手动补录打卡'; playFx('stamp', .3); toast('已完成打卡：' + c.name);
@@ -2712,6 +2839,7 @@ const ACT = {
 
   /* 骑行历史记录与统计弹窗 */
   openRideStats: scope => {
+    if (window.KnightNativeMaps && scope !== 'crew') return sendCyclingMapAction('cyclingHistory');
     playFx('tab', .20);
     S.statsSheet.tab = scope === 'crew' ? 'crew' : 'me';
     S.statsSheet.expanded = false;
@@ -2719,6 +2847,10 @@ const ACT = {
     openSheet(part('rideStats', rideStatsSheetHTML));
   },
   statsTab: t => {
+    if (window.KnightNativeMaps && t === 'me') {
+      closeSheet();
+      return sendCyclingMapAction('cyclingHistory');
+    }
     if (S.statsSheet.tab === t) return;
     S.statsSheet.tab = t; S.statsSheet.expanded = false; S.statsSheet.openIdx = null;
     playFx('tick', .18); upd('rideStats');
@@ -2802,6 +2934,16 @@ const ACT = {
 
   /* Destination, Team & Ride */
   destSheet: () => {
+    if (window.KnightNativeMaps) {
+      openSheet(`
+        <div class="sh-hd"><h4>骑行目的地</h4><button class="xbtn" type="button" data-act="sheetClose">${ic('x', 16)}</button></div>
+        <div class="grp">
+          <button class="grp-row" type="button" data-act="cyclingPlace"><b>搜索高德地点</b>${ic('chev', 14)}</button>
+          <button class="grp-row" type="button" data-act="cyclingClear"><b>自由骑行（不设终点）</b></button>
+        </div>
+      `);
+      return;
+    }
     playFx('tab', .20);
     openSheet(`
       <div class="sh-hd"><h4>选择目的地</h4><button class="xbtn" type="button" data-act="sheetClose">${ic('x', 16)}</button></div>
@@ -2823,11 +2965,13 @@ const ACT = {
     `);
   },
   pickSpot: i => {
+    if (window.KnightNativeMaps) return;
     S.destIdx = +i < 0 ? null : +i; closeSheet(); playFx('tick', .22);
     if (S.destIdx != null) prism3d.setHud({ line1:'↱ 280m', line2:SPOTS[S.destIdx].road });
     render(false);
   },
   customSpotGo: () => {
+    if (window.KnightNativeMaps) return;
     const v = (($('#customSpotIn') || {}).value || '').trim();
     if (!v) return toast('请输入目的地');
     SPOTS.unshift({ name:v, sub:'22 km · 摩托路线 · 已避禁摩', km:22, road:v });
@@ -2863,6 +3007,10 @@ const ACT = {
   },
   teamDismiss: () => { S.team.saved = false; S.team.code = ''; TM.forEach(m => S.team.m[m.id] = 'off'); playFx('tick', .2); render(false); },
   startRide: () => startRide(),
+  cyclingPlace: () => { closeSheet(); sendCyclingMapAction('cyclingPlace'); },
+  cyclingClear: () => { closeSheet(); sendCyclingMapAction('cyclingClear'); },
+  cyclingHistory: () => sendCyclingMapAction('cyclingHistory'),
+  cyclingCheckIns: () => sendCyclingMapAction('cyclingCheckIns'),
   endRide: () => endRide(),
   navSimWx: () => triggerNavWx(),
   navReplyWx: () => { hideBanner(); startAiTask('wx'); },

@@ -1,8 +1,11 @@
 #import <UIKit/UIKit.h>
+#import "KnightCyclingMaps.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
 @interface KnightRideNavigation : UIViewController
+@property (nonatomic, strong, nullable) KnightMapPlace *destination;
+@property (nonatomic, copy, nullable) void (^voiceStartResult)(BOOL started, NSString *detail);
 + (BOOL)sdkAvailable;
 - (instancetype)initWithStore:(NSString *)store
                          city:(nullable NSString *)city

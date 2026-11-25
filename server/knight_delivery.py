@@ -20,15 +20,21 @@ PHONE_RESULT_PATH = re.compile(r'/api/delivery/tasks/([a-f0-9]{32})/phone-result
 VOICE_FEEDBACK_PATH = re.compile(r'/api/voice/delivery-tasks/([a-f0-9]{32})/feedback')
 VOICE_FEEDBACK_TEXT_PATH = re.compile(r'/api/voice/delivery-tasks/([a-f0-9]{32}|latest)/feedback-text')
 VOICE_PICKUP_CONFIRM_PATH = re.compile(r'/api/voice/delivery-tasks/([a-f0-9]{32})/confirm-pickup')
+VOICE_PICKUP_CONTINUE_PATH = re.compile(r'/api/voice/delivery-tasks/([a-f0-9]{32})/continue-pickup')
+VOICE_RIDE_PATH = re.compile(r'/api/voice/delivery-tasks/([a-f0-9]{32})/ride')
+PHONE_RIDE_RESULT_PATH = re.compile(r'/api/delivery/tasks/([a-f0-9]{32})/ride-result')
 PICKUP_SUMMARY_FIELDS = ('store', 'item', 'quantity', 'total', 'pickup_address')
 REQUEST_ID = re.compile(r'[A-Za-z0-9_-]{16,80}')
 MAX_AGE = 300
+RIDE_REQUEST_AGE = 105
 QUOTE_AGE = 180
 MONEY = r'[¥￥]?\s*(\d{1,6}(?:\.\d{1,2})?)\s*元?'
 ELEMENT = re.compile(r'^([ +])(\d+) (\w+) "(.*)" \[(-?\d+),(-?\d+),(\d+),(\d+)\]$')
 PURCHASE = re.compile(r'下单|支付|付款|立即购买|确认购买|提交订单|免密|授信')
 CHECKOUT = frozenset(('去结算', '结算', '确认订单'))
 TASK_FIELDS = ('query', 'quantity', 'merchant', 'options', 'budget_cents', 'pickup_destination')
+NO_ADDED_SUGAR = '不额外加糖'
+SUGAR_CLARIFICATION = 'no_added_sugar'
 PICKUP_TABS = ('到店自取', '到店自提', '自取', '自提')
 PICKUP_ADDRESS = re.compile(r'(?:自取地址|自提地址|取餐地址|门店地址)\s*[：:]\s*(.+)')
 DELIVERY_ADDRESS = re.compile(r'(?:收货地址|配送至|送至)(?:\s*[：:]\s*|\s+)(.+)')
@@ -80,11 +86,26 @@ def initialize(db):
         db.execute('ALTER TABLE delivery_tasks ADD COLUMN phone_lease TEXT')
     if 'pickup_navigation' not in columns:
         db.execute('ALTER TABLE delivery_tasks ADD COLUMN pickup_navigation TEXT')
+    if 'clarification' not in columns:
+        db.execute('ALTER TABLE delivery_tasks ADD COLUMN clarification TEXT')
+    if 'resumed_from' not in columns:
+        db.execute('ALTER TABLE delivery_tasks ADD COLUMN resumed_from TEXT')
+    if 'cart_added' not in columns:
+        db.execute('ALTER TABLE delivery_tasks ADD COLUMN cart_added INTEGER NOT NULL DEFAULT 0')
+    db.execute('''CREATE TABLE IF NOT EXISTS pickup_rides (
+        task_id TEXT PRIMARY KEY, state TEXT NOT NULL, asked_at INTEGER NOT NULL,
+        lease TEXT, note TEXT NOT NULL DEFAULT ''
+    )''')
 
 
 def display(row):
-    return {key: (json.loads(value) if key in {'quote', 'pickup_navigation'} and value else value)
-            for key, value in dict(row).items() if key not in {'source', 'request_id', 'quote_fingerprint', 'phone_lease'}}
+    fields = {key: (json.loads(value) if key in {'quote', 'pickup_navigation'} and value else value)
+              for key, value in dict(row).items()
+              if key not in {'source', 'request_id', 'quote_fingerprint', 'phone_lease'}}
+    if row['state'] in ('queued', 'preparing', 'pickup_checkout') or row['clarification'] == SUGAR_CLARIFICATION:
+        started_at = row['created_at'] if row['state'] in ('queued', 'preparing') else row['updated_at']
+        fields['expires_in'] = max(0, started_at + MAX_AGE - int(time.time()))
+    return {**fields, 'voice_request': row['source'] == 'device'}
 
 
 def task(db, task_id):
@@ -96,7 +117,17 @@ def task(db, task_id):
 
 def list_tasks(db):
     rows = db.execute('SELECT * FROM delivery_tasks ORDER BY rowid DESC LIMIT 15').fetchall()
-    return {'tasks': [display(row) for row in rows]}
+    rides = {row['task_id']: row for row in db.execute(
+        'SELECT * FROM pickup_rides WHERE task_id IN (SELECT id FROM delivery_tasks ORDER BY rowid DESC LIMIT 15)')}
+    now = int(time.time())
+    result = []
+    for row in rows:
+        fields = display(row)
+        if row['id'] in rides:
+            ride = ride_display(rides[row['id']], now)
+            fields.update(ride_state=ride['state'], ride_note=ride['text'])
+        result.append(fields)
+    return {'tasks': result}
 
 
 def text_field(payload, key, size):
@@ -130,15 +161,20 @@ def claim_phone_task(db, payload):
             db.execute("UPDATE delivery_tasks SET state='preparing', phone_lease=?, updated_at=?, note='iPhone 正在操控美团' WHERE id=?",
                        (lease, now, row['id']))
             row = task(db, row['id'])
-        return Status.OK, {**display(row), 'expires_in': row['created_at'] + MAX_AGE - now,
-                           'voice_request': row['source'] == 'device'}
+        fields = display(row)
+        expected_store = (fields['pickup_navigation'] or {}).get('store') if row['resumed_from'] else None
+        return Status.OK, {**fields, 'expires_in': row['created_at'] + MAX_AGE - now,
+                           'expected_pickup_store': expected_store}
 
 
 def finish_phone_task(db, task_id, payload):
     lease = text_field(payload, 'lease', 80)
     state = payload.get('state')
+    cart_added = payload.get('cart_added', False)
     if not REQUEST_ID.fullmatch(lease) or state not in ('needs_input', 'pickup_checkout'):
         raise DeliveryError(Status.BAD_REQUEST, 'invalid_phone_result')
+    if type(cart_added) is not bool or cart_added and payload.get('clarification') is not None:
+        raise DeliveryError(Status.BAD_REQUEST, 'invalid_cart_result')
     now = int(time.time())
     with db:
         db.execute('BEGIN IMMEDIATE')
@@ -178,8 +214,13 @@ def finish_phone_task(db, task_id, payload):
                 raise DeliveryError(Status.BAD_REQUEST, 'invalid_pickup_navigation')
             navigation = {**(navigation or {}), 'store': store, 'address': address}
             note = 'iPhone 已停在美团自提结算页，请核对后付款'
-        db.execute('UPDATE delivery_tasks SET state=?, note=?, quote=?, pickup_navigation=?, updated_at=? WHERE id=?',
-                   (state, note, quote, json.dumps(navigation, ensure_ascii=False) if navigation else None, now, task_id))
+        clarification = payload.get('clarification')
+        if clarification is not None and (clarification != SUGAR_CLARIFICATION or state != 'needs_input' or
+                                          not navigation or not any(option in ('无糖', '不加糖') for option in split_options(row['options']))):
+            raise DeliveryError(Status.BAD_REQUEST, 'invalid_pickup_clarification')
+        db.execute('UPDATE delivery_tasks SET state=?, note=?, quote=?, pickup_navigation=?, clarification=?, cart_added=?, updated_at=? WHERE id=?',
+                   (state, note, quote, json.dumps(navigation, ensure_ascii=False) if navigation else None,
+                    clarification, cart_added, now, task_id))
         return Status.OK, display(task(db, task_id))
 
 
@@ -213,16 +254,94 @@ def pickup_feedback_text(row, now, field_order=PICKUP_SUMMARY_FIELDS):
         facts = dict(store=quote['store'], item=quote['item'], quantity=f'共{quote["quantity"]}杯',
                      total=f'应付{total}', pickup_address=f'取餐地址，{quote["pickup_address"]}')
         summary = '。'.join(facts[field] for field in field_order)
-        return f'美团自提结算页已就绪。{summary}。请在美团核对后付款。'
+        return f'美团自提结算页已就绪。{summary}。停稳后，请在美团核对后付款。需要骑行导航时，请说开始导航。'
     if state == 'cancelled':
         return '这笔美团自提任务已取消。'
     if state == 'reviewed':
         return '这笔骑士自提任务已结束。请在美团查看订单状态。'
     if state == 'needs_input':
+        if row['clarification'] == SUGAR_CLARIFICATION:
+            if row['updated_at'] + MAX_AGE <= now:
+                return '这笔自提的语音答复已过期，可以重新说出自提需求。'
+            return '这家门店只有不额外加糖、半糖和全糖。你接受不额外加糖吗？如果接受，请说可以，就不额外加糖。'
         note = row['note'].strip('。')
+        if row['cart_added']:
+            return f'商品已加购，尚未核对到美团自提结算页。{note}。'
         if note:
             return f'这笔美团自提还未完成。{note}。'
     return '骑士还未核对到美团自提结算页。请打开骑士 App 查看。'
+
+
+def ride_display(ride, now):
+    state = ride['state']
+    if state in ('queued', 'starting') and now >= ride['asked_at'] + RIDE_REQUEST_AGE:
+        return {'state': 'failed', 'text': '没有确认高德 GPS 导航启动，请在骑士核对导航状态。'}
+    messages = {'queued': '骑士正在准备自提导航。', 'starting': '骑士正在规划并启动高德 GPS 骑行导航。',
+                'active': '高德 GPS 骑行导航已启动。', 'failed': '高德 GPS 骑行导航未启动。'}
+    return {'state': state, 'text': messages[state] + ride['note']}
+
+
+def request_pickup_ride(db, task_id):
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        row = task(db, task_id)
+        if (row['source'] != 'device' or not row['pickup_destination'] or not row['phone_lease']
+                or latest_voice_pickup_id(db) != task_id or row['state'] != 'pickup_checkout'
+                or not row['quote'] or now >= row['updated_at'] + MAX_AGE):
+            raise DeliveryError(Status.CONFLICT, 'verified_pickup_required')
+        existing = db.execute('SELECT * FROM pickup_rides WHERE task_id=?', (task_id,)).fetchone()
+        if existing and existing['state'] != 'failed':
+            return Status.OK, ride_display(existing, now)
+        db.execute("""INSERT INTO pickup_rides (task_id,state,asked_at) VALUES (?,'queued',?)
+                      ON CONFLICT(task_id) DO UPDATE SET state='queued', asked_at=excluded.asked_at, lease=NULL, note=''""",
+                   (task_id, now))
+        return Status.CREATED, {'state': 'queued', 'text': '骑士正在准备自提导航。'}
+
+
+def pickup_ride_feedback(db, task_id):
+    row = task(db, task_id)
+    ride = db.execute('SELECT * FROM pickup_rides WHERE task_id=?', (task_id,)).fetchone()
+    if row['source'] != 'device' or ride is None:
+        raise DeliveryError(Status.NOT_FOUND, 'pickup_ride_not_found')
+    result = ride_display(ride, int(time.time()))
+    return None if result['state'] in ('queued', 'starting') else result
+
+
+def claim_pickup_ride(db, payload):
+    lease = text_field(payload, 'lease', 80)
+    if not REQUEST_ID.fullmatch(lease):
+        raise DeliveryError(Status.BAD_REQUEST, 'invalid_ride_lease')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        ride = db.execute('''SELECT r.*, t.pickup_navigation FROM pickup_rides r
+             JOIN delivery_tasks t ON t.id=r.task_id WHERE r.asked_at>? AND t.source='device'
+             AND t.quote IS NOT NULL AND t.state='pickup_checkout'
+             AND t.id=(SELECT id FROM delivery_tasks WHERE source='device' AND pickup_destination<>'' ORDER BY rowid DESC LIMIT 1)
+             AND t.phone_lease IS NOT NULL AND t.updated_at>? AND (r.state='queued' OR (r.state='starting' AND r.lease=?))
+             ORDER BY r.asked_at LIMIT 1''', (now - RIDE_REQUEST_AGE, now - MAX_AGE, lease)).fetchone()
+        if ride is None:
+            return Status.OK, None
+        db.execute("UPDATE pickup_rides SET state='starting', lease=? WHERE task_id=?", (lease, ride['task_id']))
+        return Status.OK, {'id': ride['task_id'], 'place': json.loads(ride['pickup_navigation'])}
+
+
+def finish_pickup_ride(db, task_id, payload):
+    lease = text_field(payload, 'lease', 80)
+    state = payload.get('state')
+    if not REQUEST_ID.fullmatch(lease) or state not in ('active', 'failed'):
+        raise DeliveryError(Status.BAD_REQUEST, 'invalid_ride_result')
+    note = text_field(payload, 'note', 180) if state == 'failed' else ''
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        ride = db.execute('SELECT * FROM pickup_rides WHERE task_id=?', (task_id,)).fetchone()
+        if ride is None or ride['lease'] != lease or ride['state'] not in ('starting', state):
+            raise DeliveryError(Status.CONFLICT, 'pickup_ride_lease_invalid')
+        if ride['state'] == 'starting':
+            db.execute('UPDATE pickup_rides SET state=?, note=? WHERE task_id=?', (state, note, task_id))
+            ride = db.execute('SELECT * FROM pickup_rides WHERE task_id=?', (task_id,)).fetchone()
+        return Status.OK, ride_display(ride, int(time.time()))
 
 
 def pickup_bluetooth_receipt(db, task_id, device_key, summarize=None):
@@ -257,6 +376,52 @@ def confirm_voice_pickup(db, task_id):
     return Status.OK, {'text': '已记录这笔自提的语音确认。请在手机美团核对并付款。'}
 
 
+def split_options(options):
+    return [part for part in re.split(r'[，,、\s]+', options) if part]
+
+
+def active_delivery(db):
+    return db.execute("""SELECT 1 FROM delivery_tasks
+        WHERE state IN ('queued','preparing','pickup_checkout','awaiting_confirmation','approved','submitting','unknown')
+        LIMIT 1""").fetchone()
+
+
+def continue_voice_pickup(db, task_id, payload):
+    request_id = text_field(payload, 'request_id', 80)
+    accepted = text_field(payload, 'selection', 24)
+    if not REQUEST_ID.fullmatch(request_id) or accepted != NO_ADDED_SUGAR:
+        raise DeliveryError(Status.BAD_REQUEST, 'invalid_pickup_selection')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        existing = db.execute("SELECT * FROM delivery_tasks WHERE source='device' AND request_id=?", (request_id,)).fetchone()
+        if existing:
+            if existing['resumed_from'] != task_id:
+                raise DeliveryError(Status.CONFLICT, 'request_id_reused')
+            return Status.OK, display(existing)
+        row = task(db, task_id)
+        if (row['source'] != 'device' or not row['pickup_destination'] or row['state'] != 'needs_input' or
+            row['clarification'] != SUGAR_CLARIFICATION or row['updated_at'] + MAX_AGE <= now or
+            row['quote'] or not row['pickup_navigation'] or latest_voice_pickup_id(db) != task_id):
+            raise DeliveryError(Status.CONFLICT, 'pickup_clarification_unavailable')
+        expire_phone_tasks(db, now)
+        if active_delivery(db):
+            raise DeliveryError(Status.CONFLICT, 'delivery_busy')
+        options = '、'.join(accepted if value in ('无糖', '不加糖') else value for value in split_options(row['options']))
+        if not options or options == row['options'] or len(options) > 48:
+            raise DeliveryError(Status.CONFLICT, 'invalid_pickup_selection')
+        new_id = uuid4().hex
+        db.execute("""INSERT INTO delivery_tasks
+            (id, request_id, source, query, quantity, merchant, options, budget_cents, pickup_destination,
+             state, note, created_at, updated_at, pickup_navigation, resumed_from)
+            VALUES (?, ?, 'device', ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)""",
+            (new_id, request_id, row['query'], row['quantity'], row['merchant'], options, row['budget_cents'],
+             row['pickup_destination'], '已收到语音答复，继续准备', now, now, row['pickup_navigation'], task_id))
+        db.execute("UPDATE delivery_tasks SET state='reviewed', note=?, clarification=NULL, updated_at=? WHERE id=?",
+                   ('已按语音答复继续准备', now, task_id))
+        return Status.CREATED, display(task(db, new_id))
+
+
 def enqueue(db, source, payload):
     request_id = text_field(payload, 'request_id', 80)
     query = text_field(payload, 'query', 48)
@@ -278,8 +443,7 @@ def enqueue(db, source, payload):
             if tuple(existing[field] for field in TASK_FIELDS) != fields:
                 raise DeliveryError(Status.CONFLICT, 'request_id_reused')
             return Status.OK, display(existing)
-        active = db.execute("SELECT 1 FROM delivery_tasks WHERE state IN ('queued','preparing','pickup_checkout','awaiting_confirmation','approved','submitting','unknown')").fetchone()
-        if active:
+        if active_delivery(db):
             raise DeliveryError(Status.CONFLICT, 'delivery_busy')
         now, task_id = int(time.time()), uuid4().hex
         db.execute('''INSERT INTO delivery_tasks
