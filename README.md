@@ -12,6 +12,10 @@
 | [server](server) | 可选的局域网订单服务、回归测试与头显调试工具 |
 | [docs/hud/ai-hud-protocol.md](docs/hud/ai-hud-protocol.md) | 蓝牙 UUID、UTF-8 分片和头显命令 |
 
+## 双 ESP32 显示方案
+
+小智 ESP32-S3 负责语音与头盔 HUD，另一块 ESP32 驱动车载屏。骑士 App 统一算路并分别发送导航指引。方案已整理，双板联调和实体 HUD 验收待完成。[查看技术方案](docs/architecture/technical-architecture.md)
+
 ## 构建 iPhone App
 
 用 Xcode 打开 `app/骑士Knight-iOS/KnightApp.xcodeproj`，选择 `KnightApp`。真机安装前在 Signing & Capabilities 选择自己的开发团队和 Bundle ID，部署目标为 iOS 15 及以上。
