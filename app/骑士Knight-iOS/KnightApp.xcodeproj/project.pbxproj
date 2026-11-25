@@ -1,0 +1,297 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000010000000000000001 /* KnightApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000001 /* KnightApp.swift */; };
+		A10000020000000000000002 /* KnightWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000020000000000000002 /* KnightWebView.swift */; };
+		A10000030000000000000003 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000030000000000000003 /* Assets.xcassets */; };
+		A10000040000000000000004 /* WebApp in Resources */ = {isa = PBXBuildFile; fileRef = A20000040000000000000004 /* WebApp */; };
+		A10000050000000000000005 /* KnightPhoneSearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000060000000000000006 /* KnightPhoneSearch.swift */; };
+		A10000060000000000000006 /* InProcess.m in Sources */ = {isa = PBXBuildFile; fileRef = A20000070000000000000007 /* InProcess.m */; };
+		A10000070000000000000007 /* RecoveredNative.m in Sources */ = {isa = PBXBuildFile; fileRef = A20000080000000000000008 /* RecoveredNative.m */; };
+		A10000080000000000000008 /* KnightRideNavigation.m in Sources */ = {isa = PBXBuildFile; fileRef = A20000100000000000000010 /* KnightRideNavigation.m */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000000 /* KnightApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KnightApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000010000000000000001 /* KnightApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KnightApp.swift; sourceTree = "<group>"; };
+		A20000020000000000000002 /* KnightWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KnightWebView.swift; sourceTree = "<group>"; };
+		A20000030000000000000003 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A20000040000000000000004 /* WebApp */ = {isa = PBXFileReference; lastKnownFileType = folder; path = WebApp; sourceTree = "<group>"; };
+		A20000050000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A20000060000000000000006 /* KnightPhoneSearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KnightPhoneSearch.swift; sourceTree = "<group>"; };
+		A20000070000000000000007 /* InProcess.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = PokiNative/InProcess.m; sourceTree = "<group>"; };
+		A20000080000000000000008 /* RecoveredNative.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = PokiNative/RecoveredNative.m; sourceTree = "<group>"; };
+		A20000090000000000000009 /* AMapDebug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = AMapDebug.xcconfig; sourceTree = "<group>"; };
+		A20000100000000000000010 /* KnightRideNavigation.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = KnightRideNavigation.m; sourceTree = "<group>"; };
+		A20000110000000000000011 /* KnightRideNavigation.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = KnightRideNavigation.h; sourceTree = "<group>"; };
+		A20000120000000000000012 /* AMapSDK.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = AMapSDK.xcconfig; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A30000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A40000000000000000000000 = {
+			isa = PBXGroup;
+			children = (
+				A40000010000000000000001 /* KnightApp */,
+				A40000020000000000000002 /* Products */,
+				A20000090000000000000009 /* AMapDebug.xcconfig */,
+				A20000120000000000000012 /* AMapSDK.xcconfig */,
+			);
+			sourceTree = "<group>";
+		};
+		A40000010000000000000001 /* KnightApp */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000001 /* KnightApp.swift */,
+				A20000020000000000000002 /* KnightWebView.swift */,
+				A20000030000000000000003 /* Assets.xcassets */,
+				A20000040000000000000004 /* WebApp */,
+				A20000050000000000000005 /* Info.plist */,
+				A20000060000000000000006 /* KnightPhoneSearch.swift */,
+				A20000070000000000000007 /* InProcess.m */,
+				A20000080000000000000008 /* RecoveredNative.m */,
+				A20000100000000000000010 /* KnightRideNavigation.m */,
+				A20000110000000000000011 /* KnightRideNavigation.h */,
+			);
+			path = KnightApp;
+			sourceTree = "<group>";
+		};
+		A40000020000000000000002 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A20000000000000000000000 /* KnightApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A50000010000000000000001 /* KnightApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A80000020000000000000002 /* Build configuration list for PBXNativeTarget "KnightApp" */;
+			buildPhases = (
+				A60000010000000000000001 /* Sources */,
+				A30000010000000000000001 /* Frameworks */,
+				A60000020000000000000002 /* Resources */,
+				A60000030000000000000003 /* Copy AMap resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KnightApp;
+			productName = KnightApp;
+			productReference = A20000000000000000000000 /* KnightApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A70000010000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					A50000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = A80000010000000000000001 /* Build configuration list for PBXProject "KnightApp" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = zh_CN;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				"zh-Hans",
+				Base,
+			);
+			mainGroup = A40000000000000000000000;
+			productRefGroup = A40000020000000000000002 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A50000010000000000000001 /* KnightApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A60000020000000000000002 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000030000000000000003 /* Assets.xcassets in Resources */,
+				A10000040000000000000004 /* WebApp in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A60000030000000000000003 /* Copy AMap resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			name = "Copy AMap resources";
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ \"$KNIGHT_AMAP_SDK_ENABLED\" = YES ]; then\n  \"$SRCROOT/copy_amap_resources.sh\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A60000010000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000001 /* KnightApp.swift in Sources */,
+				A10000020000000000000002 /* KnightWebView.swift in Sources */,
+				A10000050000000000000005 /* KnightPhoneSearch.swift in Sources */,
+				A10000060000000000000006 /* InProcess.m in Sources */,
+				A10000070000000000000007 /* RecoveredNative.m in Sources */,
+				A10000080000000000000008 /* KnightRideNavigation.m in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A90000010000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A90000020000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A90000030000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A20000090000000000000009 /* AMapDebug.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+
+				CURRENT_PROJECT_VERSION = 17;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = KnightApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"/System/Developer/usr/lib",
+					"/System/Developer/Library/PrivateFrameworks",
+					"/System/Developer/Library/Frameworks",
+				);
+				MARKETING_VERSION = 1.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.knight.motoapp.demo;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = KnightApp/PokiNative/KnightPokiBridge.h;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A90000040000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A20000120000000000000012 /* AMapSDK.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				EXCLUDED_SOURCE_FILE_NAMES = ("InProcess.m", "RecoveredNative.m");
+
+				CURRENT_PROJECT_VERSION = 17;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = KnightApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.knight.motoapp.demo;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = KnightApp/KnightRideNavigation.h;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A80000010000000000000001 /* Build configuration list for PBXProject "KnightApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000010000000000000001 /* Debug */,
+				A90000020000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A80000020000000000000002 /* Build configuration list for PBXNativeTarget "KnightApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000030000000000000003 /* Debug */,
+				A90000040000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A70000010000000000000001 /* Project object */;
+}

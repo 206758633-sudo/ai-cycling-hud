@@ -1,0 +1,16 @@
+AI骑行头显设备
+Copyright 2026 AI骑行头显设备 contributors
+
+The project’s original contributions are available under Apache License 2.0.
+This repository also contains the following upstream software:
+
+- xiaozhi-esp32, MIT. Copyright (c) 2025 Shenzhen Xinzhi Future Technology Co., Ltd.
+  and Project Contributors. See firmware/xiaozhi-esp32/LICENSE and the
+  upstream at https://github.com/78/xiaozhi-esp32.
+- Poki iOS automation, AGPL-3.0-only. Copyright (c) 2026 Joseph Zhou (周瑟夫)
+  and contributors. See app/骑士Knight-iOS/KnightApp/PokiNative/LICENSE
+  and the attribution in PokiNative/README.md. The iOS development build
+  that links this component is subject to the AGPL terms for the combined work.
+
+The independent components retain their applicable licenses and notices.
+AMap SDK binaries, service keys and accounts are provisioned separately.
