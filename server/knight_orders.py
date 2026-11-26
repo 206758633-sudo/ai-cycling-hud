@@ -1,6 +1,7 @@
 """Knight's LAN test-order API. Runs independently of the HUD and workspace servers."""
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from functools import partial
@@ -17,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import unicodedata
 from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 from urllib.parse import urlsplit
@@ -30,6 +32,11 @@ STATE_DIR = Path.home() / '.local/share/knight-orders'
 MENU = {'hot-americano': ('驿站热美式', 1600)}
 REQUEST_ID = re.compile(r'[a-zA-Z0-9_-]{16,80}')
 INTENT_PATH = re.compile(r'/api/orders/intents/([a-f0-9]{32})/decision')
+CYCLING_ROUTE_PATH = re.compile(r'/api/cycling/routes/([a-f0-9]{32})')
+CYCLING_RESULT_PATH = re.compile(r'/api/cycling/routes/([a-f0-9]{32})/result')
+CYCLING_HOLD_PICKUPS_PATH = re.compile(r'/api/cycling/routes/([a-f0-9]{32})/hold-pickups')
+CYCLING_QUEUE_SECONDS = 90
+CYCLING_START_SECONDS = 100
 MAX_BODY = 4096
 MAX_VOICE_AUDIO = 128 * 1024
 VOICE_FEEDBACK_WAIT = 55
@@ -142,6 +149,19 @@ def initialize(path):
             CREATE TABLE IF NOT EXISTS orders (
                 intent_id TEXT PRIMARY KEY REFERENCES intents(id), number TEXT NOT NULL UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS cycling_routes (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                destination TEXT NOT NULL, city TEXT NOT NULL, district TEXT NOT NULL,
+                state TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                lease TEXT, note TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recommendations (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL, city TEXT NOT NULL, district TEXT NOT NULL, destination TEXT NOT NULL,
+                state TEXT NOT NULL, lease TEXT, expires_at INTEGER NOT NULL,
+                store TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
+                dishes TEXT NOT NULL DEFAULT '[]', note TEXT NOT NULL DEFAULT ''
+            );
         ''')
         with db:
             db.execute('BEGIN IMMEDIATE')
@@ -152,6 +172,305 @@ def order_view(db, intent_id):
     row = dict(db.execute(ORDER_VIEW + ' WHERE i.id = ?', (intent_id,)).fetchone())
     row['total_cents'] = row['quantity'] * row['unit_cents']
     return row
+
+
+def cycling_text(body, field, limit, required=False):
+    value = body.get(field, '')
+    if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise APIError(Status.BAD_REQUEST, 'invalid_cycling_route')
+    value = value.strip()
+    if required and not value:
+        raise APIError(Status.BAD_REQUEST, 'invalid_cycling_route')
+    return value
+
+
+def expire_cycling_routes(db, now):
+    db.execute("""UPDATE cycling_routes SET state='expired', note='导航任务已过期', updated_at=?
+                  WHERE state IN ('queued', 'starting') AND expires_at<=?""", (now, now))
+    resume_paused_deliveries(db, now)
+
+
+def resume_paused_deliveries(db, now):
+    db.execute("""UPDATE delivery_tasks SET state='queued', paused_for_route=NULL, phone_lease=NULL,
+                  note='导航已结束，正在自动续办点单', rescheduled_at=?, updated_at=?
+                  WHERE state='paused' AND paused_for_route IN
+                  (SELECT id FROM cycling_routes WHERE state IN ('failed','ended','expired'))""", (now, now))
+
+
+def pending_cycling_route(db):
+    with db:
+        expire_cycling_routes(db, int(time.time()))
+        row = db.execute("SELECT id FROM cycling_routes WHERE state='queued' ORDER BY rowid LIMIT 1").fetchone()
+        return (Status.OK, {'id': row['id']}) if row else (Status.NO_CONTENT, None)
+
+
+def hold_pickups_for_cycling(db, route_id, body):
+    lease = cycling_text(body, 'lease', 80, required=True)
+    if not REQUEST_ID.fullmatch(lease):
+        raise APIError(Status.BAD_REQUEST, 'invalid_cycling_lease')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        route = db.execute("SELECT state,lease FROM cycling_routes WHERE id=?", (route_id,)).fetchone()
+        if not route or route['lease'] != lease or route['state'] != 'active':
+            return Status.NO_CONTENT, None
+        db.execute("""UPDATE delivery_tasks SET state='paused', paused_for_route=?, updated_at=?,
+                      note='导航中，结束后自动续办点单'
+                      WHERE state='queued' AND pickup_destination<>''
+                        AND COALESCE(NULLIF(rescheduled_at,0),created_at)>?""",
+                   (route_id, now, now - delivery.MAX_AGE))
+        return Status.NO_CONTENT, None
+
+
+def navigation_speech_packet(body, device_key):
+    session = cycling_text(body, 'session', 32, required=True)
+    kind = body.get('kind')
+    sequence = body.get('sequence')
+    modes = {'start': b'S', 'keep': b'H', 'step': b'G', 'end': b'E'}
+    if (not re.fullmatch(r'[a-f0-9]{32}', session) or not isinstance(kind, str) or kind not in modes or
+            type(sequence) is not int or not 0 <= sequence <= 0xffffffff):
+        raise APIError(Status.BAD_REQUEST, 'invalid_navigation_speech')
+    text = ''
+    if kind == 'step':
+        turn = cycling_text(body, 'turn', 16, required=True)
+        distance = cycling_text(body, 'distance', 12, required=True)
+        directions = {'左转', '右转', '向左前', '向右前', '向左后', '向右后', '掉头', '直行',
+                      '进环岛', '环岛左转', '环岛右转', '环岛直行', '环岛掉头', '出环岛',
+                      '走天桥', '走地下通道', '到达终点', '按路线'}
+        if turn not in directions or not re.fullmatch(r'(?:[0-9]{1,3}米|[0-9]{1,4}\.[0-9]公里)', distance):
+            raise APIError(Status.BAD_REQUEST, 'invalid_navigation_instruction')
+        text = f'前方{distance}，{turn}。'
+    elif kind == 'end' and body.get('arrived') is True:
+        text = '已到达骑行目的地。'
+    expires = int(time.time()) + 12
+    payload = b'N1' + session.encode('ascii') + expires.to_bytes(4, 'big')
+    payload += modes[kind] + f'{sequence:08x}'.encode('ascii') + text.encode('utf-8')
+    signed = payload + hmac.digest(device_key, payload, 'sha256')
+    return Status.OK, {'packet': base64.b64encode(signed).decode('ascii'), 'expires_at': expires}
+
+
+def enqueue_recommendation(db, body):
+    request_id = cycling_text(body, 'request_id', 80, required=True)
+    category = cycling_text(body, 'category', 32, required=True)
+    city = cycling_text(body, 'city', 32, required=True)
+    district = cycling_text(body, 'district', 32)
+    destination = cycling_destination(cycling_text(body, 'destination', 96, required=True))
+    if not REQUEST_ID.fullmatch(request_id):
+        raise APIError(Status.BAD_REQUEST, 'invalid_recommendation_request')
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        existing = db.execute('SELECT * FROM recommendations WHERE request_id=?', (request_id,)).fetchone()
+        if existing:
+            if tuple(existing[key] for key in ('category', 'city', 'district', 'destination')) != (
+                    category, city, district, destination):
+                raise APIError(Status.CONFLICT, 'recommendation_request_id_conflict')
+            return Status.OK, {'id': existing['id']}
+        job_id = uuid4().hex
+        db.execute('''INSERT INTO recommendations (id,request_id,category,city,district,destination,state,expires_at)
+                      VALUES (?,?,?,?,?,?,'queued',?)''',
+                   (job_id, request_id, category, city, district, destination, int(time.time()) + 90))
+        return Status.CREATED, {'id': job_id}
+
+
+def claim_recommendation(db, body):
+    lease = cycling_text(body, 'lease', 80, required=True)
+    if not REQUEST_ID.fullmatch(lease):
+        raise APIError(Status.BAD_REQUEST, 'invalid_recommendation_lease')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute("""SELECT id,category,city,district,destination,state,lease FROM recommendations
+                            WHERE state IN ('queued','searching') AND expires_at>? ORDER BY rowid LIMIT 1""",
+                         (now,)).fetchone()
+        if not row or (row['state'] == 'searching' and row['lease'] != lease):
+            return Status.NO_CONTENT, None
+        if row['state'] == 'queued':
+            db.execute("UPDATE recommendations SET state='searching',lease=?,expires_at=? WHERE id=?",
+                       (lease, now + 120, row['id']))
+        return Status.OK, {key: row[key] for key in ('id', 'category', 'city', 'district', 'destination')}
+
+
+def finish_recommendation(db, body, device_key):
+    job_id = cycling_text(body, 'id', 32, required=True)
+    lease = cycling_text(body, 'lease', 80, required=True)
+    store = cycling_text(body, 'store', 96)
+    address = cycling_text(body, 'address', 150)
+    note = cycling_text(body, 'note', 170)
+    shown = body.get('shown')
+    dishes = body.get('dishes', [])
+    if (type(shown) is not bool or not isinstance(dishes, list) or len(dishes) > 3 or
+            any(not isinstance(dish, str) or not dish.strip() or len(dish) > 48 or any(ord(c) < 32 for c in dish)
+                for dish in dishes) or (shown and not store)):
+        raise APIError(Status.BAD_REQUEST, 'invalid_recommendation_result')
+    now = int(time.time())
+    state = 'shown' if shown else 'failed'
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        existing = db.execute('SELECT * FROM recommendations WHERE id=?', (job_id,)).fetchone()
+        if not existing or existing['lease'] != lease or existing['expires_at'] <= now:
+            raise APIError(Status.CONFLICT, 'recommendation_not_claimed')
+        if existing['state'] == 'searching':
+            db.execute('UPDATE recommendations SET state=?,store=?,address=?,dishes=?,note=?,expires_at=? WHERE id=?',
+                       (state, store, address, json.dumps(dishes, ensure_ascii=False), note, now + 300, job_id))
+        elif (existing['state'], existing['store'], existing['address'], json.loads(existing['dishes']), existing['note']) != (
+                state, store, address, dishes, note):
+            raise APIError(Status.CONFLICT, 'recommendation_result_conflict')
+    joined = '、'.join(dishes)
+    text = (f'美团门店推荐已显示。{store}。{note}。' + (f'菜品有{joined}。' if joined else '') + '要去这家店，请说开始导航。'
+            if shown else f'美团门店推荐未完成。{note}。')
+    expires = now + 90
+    packet = b'K1' + job_id.encode('ascii') + expires.to_bytes(4, 'big') + text.encode()
+    packet += hmac.digest(device_key, packet, 'sha256')
+    return Status.OK, {'packet': base64.b64encode(packet).decode('ascii'), 'expires_at': expires}
+
+
+def request_recommended_navigation(db, body):
+    job_id = cycling_text(body, 'task_id', 32, required=True)
+    row = db.execute("SELECT * FROM recommendations WHERE id=? AND state='shown' AND expires_at>?",
+                     (job_id, int(time.time()))).fetchone()
+    if not row:
+        raise APIError(Status.CONFLICT, 'recommendation_not_shown')
+    return enqueue_cycling_route(db, {'request_id': 'recommend-' + job_id, 'destination': row['store'],
+                                     'city': row['city'], 'district': row['district']})
+
+
+def relay_voice_request(db, envelope, device_key, delivery_wakeup):
+    try:
+        encoded = envelope['packet']
+        if not isinstance(encoded, str) or len(encoded) > 1600:
+            raise ValueError
+        packet = base64.b64decode(encoded, validate=True)
+        prefix = packet[:2]
+        request_id = packet[2:34].decode('ascii')
+        expires = int.from_bytes(packet[34:38], 'big')
+        if (prefix not in (b'R1', b'P1', b'V1', b'Q1', b'L1') or not re.fullmatch(r'[a-f0-9]{32}', request_id)
+                or not 71 <= len(packet) <= 1200
+                or not 0 < expires - int(time.time()) <= 30
+                or not hmac.compare_digest(hmac.digest(device_key, packet[:-32], 'sha256'), packet[-32:])):
+            raise ValueError
+        data = json.loads(packet[38:-32].decode('utf-8'))
+        if not isinstance(data, dict) or data.get('request_id') != request_id:
+            raise ValueError
+    except (KeyError, ValueError, RecursionError):
+        raise APIError(Status.BAD_REQUEST, 'invalid_voice_relay') from None
+
+    try:
+        if prefix == b'P1':
+            status, result = delivery.enqueue(db, 'device', data)
+            delivery_wakeup.set()
+            task_id = result['id']
+        elif prefix == b'V1':
+            task_id = cycling_text(data, 'task_id', 32, required=True)
+            if not re.fullmatch(r'[a-f0-9]{32}', task_id):
+                raise APIError(Status.BAD_REQUEST, 'invalid_pickup_ride_task')
+            status, _ = delivery.request_pickup_ride(db, task_id)
+        elif prefix in (b'Q1', b'L1'):
+            operation = enqueue_recommendation if prefix == b'Q1' else request_recommended_navigation
+            status, result = operation(db, data)
+            task_id = result['id']
+        else:
+            status, result = enqueue_cycling_route(db, data)
+            task_id = result['id']
+        ack = f'{int(status)}{task_id}'.encode('ascii')
+    except (APIError, delivery.DeliveryError) as error:
+        ack = str(int(error.status)).encode('ascii')
+    expiry = int(time.time()) + 25
+    response = b'A1' + packet[2:34] + expiry.to_bytes(4, 'big') + ack
+    response += hmac.digest(device_key, response, 'sha256')
+    return Status.OK, {'packet': base64.b64encode(response).decode('ascii'), 'expires_at': expiry}
+
+
+def cycling_route(db, route_id):
+    row = db.execute("""SELECT id,request_id,destination,city,district,state,expires_at,note,updated_at
+                        FROM cycling_routes WHERE id=?""", (route_id,)).fetchone()
+    if row is None:
+        raise APIError(Status.NOT_FOUND, 'cycling_route_not_found')
+    route = dict(row)
+    request_id = route.pop('request_id')
+    if request_id.startswith('recommend-'):
+        store = db.execute('SELECT address FROM recommendations WHERE id=?', (request_id[10:],)).fetchone()
+        route['recommendedStore'] = True
+        route['address'] = store['address'] if store else ''
+    return route
+
+
+def cycling_destination(value):
+    return re.sub(
+        r'地铁(?:站口|站|口)?[\s,，、(（]*([A-Za-zＡ-Ｚａ-ｚ])[\s,，、]*(?:出)?口[)）]?$',
+        lambda match: '地铁站' + unicodedata.normalize('NFKC', match[1]).upper() + '口',
+        value,
+    )
+
+
+def enqueue_cycling_route(db, body):
+    request_id = cycling_text(body, 'request_id', 80, required=True)
+    destination = cycling_destination(cycling_text(body, 'destination', 96, required=True))
+    city = cycling_text(body, 'city', 32, required=True)
+    district = cycling_text(body, 'district', 32)
+    if not REQUEST_ID.fullmatch(request_id):
+        raise APIError(Status.BAD_REQUEST, 'invalid_cycling_route')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        expire_cycling_routes(db, now)
+        existing = db.execute('SELECT id,destination,city,district FROM cycling_routes WHERE request_id=?',
+                              (request_id,)).fetchone()
+        if existing:
+            if (cycling_destination(existing['destination']), existing['city'], existing['district']) != (
+                    destination, city, district):
+                raise APIError(Status.CONFLICT, 'cycling_request_id_conflict')
+            return Status.OK, cycling_route(db, existing['id'])
+        route_id = uuid4().hex
+        db.execute("""INSERT INTO cycling_routes
+                      (id,request_id,destination,city,district,state,expires_at,updated_at)
+                      VALUES (?,?,?,?,?,'queued',?,?)""",
+                   (route_id, request_id, destination, city, district, now + CYCLING_QUEUE_SECONDS, now))
+        return Status.CREATED, cycling_route(db, route_id)
+
+
+def claim_cycling_route(db, body):
+    lease = cycling_text(body, 'lease', 80, required=True)
+    if not REQUEST_ID.fullmatch(lease):
+        raise APIError(Status.BAD_REQUEST, 'invalid_cycling_lease')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        expire_cycling_routes(db, now)
+        current = db.execute("SELECT id,lease FROM cycling_routes WHERE state='starting' LIMIT 1").fetchone()
+        if current:
+            return (Status.OK, cycling_route(db, current['id'])) if current['lease'] == lease else (Status.NO_CONTENT, None)
+        next_route = db.execute("SELECT id FROM cycling_routes WHERE state='queued' ORDER BY rowid LIMIT 1").fetchone()
+        if next_route is None:
+            return Status.NO_CONTENT, None
+        route_id = next_route['id']
+        db.execute("""UPDATE cycling_routes SET state='starting', lease=?, expires_at=?, updated_at=?
+                      WHERE id=?""", (lease, now + CYCLING_START_SECONDS, now, route_id))
+        return Status.OK, cycling_route(db, route_id)
+
+
+def finish_cycling_route(db, route_id, body):
+    lease = cycling_text(body, 'lease', 80, required=True)
+    state = cycling_text(body, 'state', 8, required=True)
+    note = cycling_text(body, 'note', 160)
+    if not REQUEST_ID.fullmatch(lease) or state not in ('active', 'failed', 'ended'):
+        raise APIError(Status.BAD_REQUEST, 'invalid_cycling_result')
+    now = int(time.time())
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        expire_cycling_routes(db, now)
+        current = cycling_route(db, route_id)
+        owner = db.execute('SELECT lease FROM cycling_routes WHERE id=?', (route_id,)).fetchone()['lease']
+        if owner != lease:
+            raise APIError(Status.CONFLICT, 'cycling_lease_mismatch')
+        if current['state'] == state and current['note'] == note:
+            return Status.OK, current
+        allowed = {'starting': ('active', 'failed'), 'active': ('active', 'ended')}
+        if state not in allowed.get(current['state'], ()):
+            raise APIError(Status.CONFLICT, 'cycling_route_state_changed')
+        db.execute('UPDATE cycling_routes SET state=?,note=?,updated_at=? WHERE id=?', (state, note, now, route_id))
+        if state in ('failed', 'ended'):
+            resume_paused_deliveries(db, now)
+        return Status.OK, cycling_route(db, route_id)
 
 
 def submit(db, payload):
@@ -259,12 +578,54 @@ class OrdersHandler(BaseHTTPRequestHandler):
         voice_pickup_continue_path = delivery.VOICE_PICKUP_CONTINUE_PATH.fullmatch(path)
         voice_ride_path = delivery.VOICE_RIDE_PATH.fullmatch(path)
         phone_ride_result_path = delivery.PHONE_RIDE_RESULT_PATH.fullmatch(path)
+        cycling_route_path = CYCLING_ROUTE_PATH.fullmatch(path)
+        cycling_result_path = CYCLING_RESULT_PATH.fullmatch(path)
+        cycling_hold_pickups_path = CYCLING_HOLD_PICKUPS_PATH.fullmatch(path)
         spoken_feedback = None
         try:
             with closing(database(self.server.db_path)) as db:
                 if method == 'GET' and path == '/api/health':
                     db.execute('SELECT 1 FROM intents LIMIT 1').fetchone()
                     result = Status.OK, {'status': 'ok', 'db': 'connected', 'service': 'knight-orders'}
+                elif method == 'POST' and path == '/api/cycling/routes':
+                    self.authorize('device')
+                    result = enqueue_cycling_route(db, self.body())
+                elif method == 'GET' and cycling_route_path:
+                    self.authorize('device')
+                    with db:
+                        expire_cycling_routes(db, int(time.time()))
+                        result = Status.OK, cycling_route(db, cycling_route_path[1])
+                elif method == 'POST' and path == '/api/cycling/phone/claim':
+                    self.authorize('phone')
+                    result = claim_cycling_route(db, self.body())
+                elif method == 'POST' and path == '/api/cycling/phone/pending':
+                    self.authorize('phone')
+                    self.body()
+                    result = pending_cycling_route(db)
+                elif method == 'POST' and path == '/api/cycling/phone/navigation-speech':
+                    self.authorize('phone')
+                    result = navigation_speech_packet(self.body(), self.server.tokens['device'])
+                elif method == 'POST' and path == '/api/voice/phone/relay':
+                    self.authorize('phone')
+                    result = relay_voice_request(db, self.body(), self.server.tokens['device'], self.server.delivery_wakeup)
+                elif method == 'POST' and path == '/api/recommendations/phone/claim':
+                    self.authorize('phone')
+                    result = claim_recommendation(db, self.body())
+                elif method == 'POST' and path == '/api/recommendations/phone/result':
+                    self.authorize('phone')
+                    result = finish_recommendation(db, self.body(), self.server.tokens['device'])
+                elif method == 'POST' and path == '/api/voice/recommendations':
+                    self.authorize('device')
+                    result = enqueue_recommendation(db, self.body())
+                elif method == 'POST' and path == '/api/voice/recommendations/navigation':
+                    self.authorize('device')
+                    result = request_recommended_navigation(db, self.body())
+                elif method == 'POST' and cycling_result_path:
+                    self.authorize('phone')
+                    result = finish_cycling_route(db, cycling_result_path[1], self.body())
+                elif method == 'POST' and cycling_hold_pickups_path:
+                    self.authorize('phone')
+                    result = hold_pickups_for_cycling(db, cycling_hold_pickups_path[1], self.body())
                 elif method == 'GET' and path == '/api/orders/intents':
                     self.authorize('phone')
                     rows = db.execute(ORDER_VIEW + " ORDER BY i.state != 'pending', i.created_at DESC, i.rowid DESC LIMIT 50")
@@ -304,7 +665,7 @@ class OrdersHandler(BaseHTTPRequestHandler):
                             break
                         time.sleep(min(0.35, remaining))
                     result = (Status.NO_CONTENT, None) if feedback is None else (
-                        Status.OK, {'id': task_id, 'text': feedback})
+                        Status.OK, {'id': task_id, 'text': feedback, 'state': delivery.task(db, task_id)['state']})
                 elif method == 'POST' and voice_pickup_confirm_path:
                     self.authorize('device')
                     result = delivery.confirm_voice_pickup(db, voice_pickup_confirm_path[1])

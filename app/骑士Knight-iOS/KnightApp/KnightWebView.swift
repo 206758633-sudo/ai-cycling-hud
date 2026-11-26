@@ -2,6 +2,8 @@ import SwiftUI
 import UIKit
 import WebKit
 import CoreBluetooth
+import CoreLocation
+import CryptoKit
 
 // ================================================================
 //  骑士 App 原生壳：WKWebView + CoreBluetooth → ESP32-S3 HUD 桥
@@ -73,18 +75,153 @@ private func knightHudFrames(_ text: String) -> [Data] {
     }
 }
 
+private struct KnightVehicleRoute {
+    private let center: CGPoint
+    private let longitudeScale: Double
+    private let units: Double
+    let id = String(UUID().uuidString.prefix(8)).lowercased()
+    let points: String
+
+    init?(_ locations: [CLLocation]) {
+        guard let first = locations.first, locations.count >= 2 else { return nil }
+        let longitudeScale = cos(first.coordinate.latitude * .pi / 180)
+        let values = locations.map {
+            CGPoint(x: $0.coordinate.longitude * longitudeScale, y: -$0.coordinate.latitude)
+        }
+        guard let minX = values.map(\.x).min(), let maxX = values.map(\.x).max(),
+              let minY = values.map(\.y).min(), let maxY = values.map(\.y).max() else { return nil }
+        let extent = max(maxX - minX, maxY - minY)
+        guard extent.isFinite, extent > 0.00001 else { return nil }
+        let center = CGPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+        let units = 239 / extent
+        let projected = values.map { CGPoint(x: ($0.x - center.x) * units + 127.5, y: ($0.y - center.y) * units + 127.5) }
+        var retained = [0, projected.count - 1]
+        // Keep the endpoints, then retain the turns with the largest deviation from each chord.
+        while retained.count < 56 {
+            var greatest = 1.0
+            var insertion: (Int, Int)?
+            for slot in 1..<retained.count {
+                let from = retained[slot - 1], to = retained[slot]
+                guard to > from + 1 else { continue }
+                let start = projected[from], end = projected[to]
+                let dx = end.x - start.x, dy = end.y - start.y
+                let span = dx * dx + dy * dy
+                for index in (from + 1)..<to {
+                    let x = projected[index].x - start.x, y = projected[index].y - start.y
+                    let fraction = span > 0 ? min(1, max(0, (x * dx + y * dy) / span)) : 0
+                    let deltaX = x - fraction * dx, deltaY = y - fraction * dy
+                    let error = deltaX * deltaX + deltaY * deltaY
+                    if error > greatest {
+                        greatest = error
+                        insertion = (slot, index)
+                    }
+                }
+            }
+            guard let (slot, index) = insertion else { break }
+            retained.insert(index, at: slot)
+        }
+        self.center = center
+        self.longitudeScale = longitudeScale
+        self.units = units
+        points = retained.map { Self.encode(projected[$0]) }.joined()
+    }
+
+    private static func encode(_ point: CGPoint) -> String {
+        String(format: "%02x%02x", Int(min(255, max(0, point.x.rounded()))), Int(min(255, max(0, point.y.rounded()))))
+    }
+
+    func position(_ coordinate: CLLocationCoordinate2D, remainingMeters: Int) -> String? {
+        guard CLLocationCoordinate2DIsValid(coordinate) else { return nil }
+        let point = CGPoint(x: (coordinate.longitude * longitudeScale - center.x) * units + 127.5,
+                            y: (-coordinate.latitude - center.y) * units + 127.5)
+        guard (-30...285).contains(point.x), (-30...285).contains(point.y) else { return nil }
+        return "L:\(id)|\(Self.encode(point))|\(min(999999, max(0, remainingMeters)))"
+    }
+}
+
 final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var webView: WKWebView!
+    private struct CyclingClaim: Decodable {
+        let id: String
+        let destination: String
+        let city: String
+        let district: String
+        let recommendedStore: Bool?
+        let address: String?
+    }
+    private struct CyclingReceipt: Codable {
+        let id: String
+        let lease: String
+        let state: String
+        let note: String
+    }
+    private struct NavigationSpeechRequest: Codable {
+        let session: String
+        let kind: String
+        let sequence: Int
+        let turn: String?
+        let distance: String?
+        let arrived: Bool
+    }
+    private struct NavigationSpeechPacket: Decodable {
+        let packet: Data
+        let expiresAt: Int
+    }
+    private let cyclingReceiptKey = "knight.cycling.route.receipts"
+    private let cyclingActiveRouteKey = "knight.cycling.route.active"
+    private var phonePoll: Timer?
+    private var phonePollBusy = false
+    private var nextOrdinaryPollAt: TimeInterval = 0
+    private var nextPickupHoldAt: TimeInterval = 0
+    private var ordinaryRouteID: String?
+    private var ordinaryRouteStarted = false
+    private var ordinaryReportedInstruction = false
+    private let pickupBluetooth = KnightPickupBluetooth()
+    private var navigationSpeechSession: String?
+    private var navigationSpeechSequence = 0
+    private var navigationSpeechTimer: Timer?
+    private var lastNavigationSpeechTurn: String?
+    private var lastNavigationSpeechBucket: Int?
+    private var currentNavigationSpeech: (turn: String, distance: String, updatedAt: TimeInterval)?
+    private var navigationStartedAt = 0
+    private lazy var cyclingLease: String = {
+        let key = "knight.cycling.route.lease"
+        let value = UserDefaults.standard.string(forKey: key) ?? UUID().uuidString.lowercased()
+        UserDefaults.standard.set(value, forKey: key)
+        return value
+    }()
     #if DEBUG
     private let phoneSearch = KnightPhoneSearch()
     private var startedPhoneSearchProbe = false
-    private var pickupPoll: Timer?
     private var pickupBusy = false
+    private var recommendationBusy = false
+    private var recommendationWritePending = false
+    private var recommendationCard: (receipt: RecommendationReceipt, text: String, deadline: TimeInterval)?
+    private let recommendationReceiptKey = "knight.phone.recommendation.receipt"
+    private var pickupHUDMessage: String?
     private let pickupClaimKey = "knight.phone.pickup.claim"
     private let pickupReceiptKey = "knight.phone.pickup.receipt"
-    private let pickupBluetooth = KnightPickupBluetooth()
+    private var deliveredOrderCards: [String] = []
+    private var sendingOrderCards: Set<String> = []
     private let rideVoiceLease = UUID().uuidString.lowercased()
     private let rideReceiptKey = "knight.phone.ride.receipt"
+
+    private struct RecommendationClaim: Decodable {
+        let id: String
+        let category: String
+        let city: String
+        let district: String
+        let destination: String
+    }
+
+    private struct RecommendationReceipt: Codable {
+        let id: String
+        let lease: String
+        let store: String
+        let dishes: [String]
+        var shown: Bool
+        var note: String
+    }
 
     private struct PickupReceipt: Codable {
         let id: String
@@ -96,6 +233,7 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         let clarification: String?
         let cartAdded: Bool?
         let voiceRequest: Bool?
+        var pausedForRoute: String? = nil
     }
 
     private struct RideVoiceClaim: Decodable {
@@ -114,11 +252,24 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         let bluetoothReceipt: BluetoothReceipt?
         let pickupNavigation: KnightPickupPlace?
         let voiceRequest: Bool?
+        let query: String?
+        let quantity: Int?
 
         struct BluetoothReceipt: Decodable {
             let packet: Data
             let expiresAt: Int
         }
+    }
+    private struct PickupHUDList: Decodable {
+        let tasks: [PickupHUDTask]
+    }
+    private struct PickupHUDTask: Decodable {
+        let id: String
+        let state: String
+        let query: String
+        let quantity: Int
+        let updatedAt: Int
+        let quote: KnightPickupQuote?
     }
     #endif
     private lazy var ordersConfig: (host: String, port: Int, token: String)? = {
@@ -164,6 +315,19 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     private var deliveredRideHUDMessage: String?
     private var rideHUDExpiresAt: TimeInterval?
     private var cyclingDestination: KnightMapPlace?
+    private var vehicleRoute: KnightVehicleRoute?
+    private var vehiclePosition: String?
+    private var sentVehicleRouteID: String?
+    private var sentVehiclePosition: String?
+    private var lastVehicleActivityAt: TimeInterval = 0
+    private var vehicleHeartbeat: Timer?
+    private var pendingVehicleClear: String?
+    private var vehicleRouteSupported = false
+    private var vehicleOrderCardsSupported = false
+    private var vehicleCapabilitiesKnown = false
+    private var vehicleWriting = false
+    private var vehicleWriteGeneration = 0
+    private var lastVehiclePositionAt: TimeInterval = 0
 
     private var rideKey: String? {
         guard KnightRideNavigation.sdkAvailable(),
@@ -178,6 +342,10 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        if let interrupted = UserDefaults.standard.string(forKey: cyclingActiveRouteKey) {
+            queueCyclingReceipt(interrupted, state: "ended", note: "骑士重启，原导航已结束")
+            UserDefaults.standard.removeObject(forKey: cyclingActiveRouteKey)
+        }
         view.backgroundColor = bgColor
         pickupMapObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
                                                                   object: nil, queue: .main) { [weak self] _ in
@@ -256,13 +424,21 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
                 self?.runPhoneSearch(query)
             }
         }
-        if ordersConfig != nil && pickupPoll == nil && !startedPhoneSearchProbe {
-            pickupBluetooth.start()
-            pickupPoll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+        #endif
+        if ordersConfig != nil && phonePoll == nil {
+            pickupBluetooth.onReady = { [weak self] in self?.refreshNavigationSpeech() }
+            pickupBluetooth.onVoiceRequest = { [weak self] packet, id in
+                Task { @MainActor in await self?.relayVoiceRequest(packet, id: id) }
+            }
+            #if DEBUG
+            if !startedPhoneSearchProbe { pickupBluetooth.start() }
+            #endif
+            phonePoll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
                 guard let self else { timer.invalidate(); return }
-                Task { @MainActor in await self.pollPhonePickup() }
+                Task { @MainActor in await self.pollPhoneWork() }
             }
         }
+        #if DEBUG
         // 调试自检：确认 KHUD 桥已注入，并跑一遍 HUD 对话演示（Release 包不包含）
         DispatchQueue.main.asyncAfter(deadline: .now() + 7) { [weak self] in
             let js = "JSON.stringify({khud:typeof window.KHUD,status:(window.KHUD?KHUD.status():null),nav:!!navigator.bluetooth})"
@@ -329,8 +505,9 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
             self.webView?.evaluateJavaScript(script, completionHandler: nil)
         }
     }
+    #endif
 
-    private func pickupRequest<T: Encodable>(_ path: String, body: T) async throws -> (Data, Int) {
+    private func orderRequest<T: Encodable>(_ path: String, body: T, method: String = "POST") async throws -> (Data, Int) {
         guard let config = ordersConfig else { throw URLError(.badURL) }
         var components = URLComponents()
         components.scheme = "http"
@@ -339,18 +516,201 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         components.path = path
         guard let url = components.url else { throw URLError(.badURL) }
         var request = URLRequest(url: url)
-        request.httpMethod = "POST"
+        request.httpMethod = method
         request.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
-        request.httpBody = try encoder.encode(body)
+        if method != "GET" { request.httpBody = try encoder.encode(body) }
         let (data, response) = try await orderSession.data(for: request)
         return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
     }
 
+    private func pollPhoneWork() async {
+        guard !phonePollBusy else { return }
+        #if DEBUG
+        guard !startedPhoneSearchProbe, !recommendationBusy else { return }
+        if pickupBusy {
+            guard phoneSearch.hasPickupExecution else { return }
+            phonePollBusy = true
+            defer { phonePollBusy = false }
+            if let (data, status) = try? await orderRequest("/api/cycling/phone/pending", body: [String: String]()),
+               status == 200, let route = try? JSONDecoder().decode([String: String].self, from: data),
+               let id = route["id"] {
+                phoneSearch.pausePickup(for: id)
+            }
+            return
+        }
+        #endif
+        guard UIApplication.shared.applicationState == .active else { return }
+        phonePollBusy = true
+        defer { phonePollBusy = false }
+        #if DEBUG
+        if let data = UserDefaults.standard.data(forKey: pickupReceiptKey),
+           let receipt = try? JSONDecoder().decode(PickupReceipt.self, from: data), receipt.state == "paused" {
+            await sendPickupReceipt(receipt)
+            return
+        }
+        #endif
+        if await pollOrdinaryCycling() { return }
+        #if DEBUG
+        if await pollRecommendation() { return }
+        await pollPhonePickup()
+        #endif
+    }
+
+    private func cyclingReceipts() -> [CyclingReceipt] {
+        guard let data = UserDefaults.standard.data(forKey: cyclingReceiptKey) else { return [] }
+        return (try? JSONDecoder().decode([CyclingReceipt].self, from: data)) ?? []
+    }
+
+    private func storeCyclingReceipts(_ receipts: [CyclingReceipt]) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(receipts), forKey: cyclingReceiptKey)
+    }
+
+    private func queueCyclingReceipt(_ id: String, state: String, note: String) {
+        var receipts = cyclingReceipts()
+        receipts.append(CyclingReceipt(id: id, lease: cyclingLease, state: state, note: String(note.prefix(160))))
+        storeCyclingReceipts(receipts)
+    }
+
+    private func pollOrdinaryCycling() async -> Bool {
+        if let receipt = cyclingReceipts().first {
+            if let (_, status) = try? await orderRequest("/api/cycling/routes/\(receipt.id)/result", body: receipt),
+               status == 200 || status == 404 || status == 409 {
+                storeCyclingReceipts(Array(cyclingReceipts().dropFirst()))
+            }
+            return false
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if ordinaryRouteStarted, let id = ordinaryRouteID {
+            if now >= nextPickupHoldAt {
+                nextPickupHoldAt = now + 8
+                _ = try? await orderRequest("/api/cycling/routes/\(id)/hold-pickups", body: ["lease": cyclingLease])
+            }
+            return true
+        }
+        guard now >= nextOrdinaryPollAt, presentedViewController == nil, ordinaryRouteID == nil else { return false }
+        guard let (data, status) = try? await orderRequest("/api/cycling/phone/claim", body: ["lease": cyclingLease]) else {
+            nextOrdinaryPollAt = now + 6
+            return false
+        }
+        if status == 404 { nextOrdinaryPollAt = now + 30 }
+        guard status == 200, let claim = try? JSONDecoder().decode(CyclingClaim.self, from: data) else { return false }
+        guard UIApplication.shared.applicationState == .active, presentedViewController == nil, let key = rideKey else {
+            queueCyclingReceipt(claim.id, state: "failed", note: "骑士未处于可启动导航的状态")
+            return true
+        }
+        ordinaryRouteID = claim.id
+        ordinaryRouteStarted = false
+        ordinaryReportedInstruction = false
+        presentRide(name: claim.destination, city: claim.city, address: claim.address, destination: nil, key: key,
+                    ordinaryRequest: true, district: claim.district, recommendedStore: claim.recommendedStore == true) { [weak self] started, detail in
+            guard let self else { return }
+            self.ordinaryRouteStarted = started
+            self.nextPickupHoldAt = 0
+            if started { UserDefaults.standard.set(claim.id, forKey: self.cyclingActiveRouteKey) }
+            self.queueCyclingReceipt(claim.id, state: started ? "active" : "failed",
+                                     note: started ? "高德 GPS 骑行导航已启动" : detail)
+            if !started {
+                self.ordinaryRouteID = nil
+                self.cyclingMapNotice(detail)
+            }
+        }
+        return true
+    }
+
+    #if DEBUG
+    private func pollRecommendation() async -> Bool {
+        let settings = UserDefaults.standard
+        if let saved = settings.data(forKey: recommendationReceiptKey),
+           let receipt = try? JSONDecoder().decode(RecommendationReceipt.self, from: saved) {
+            if let (data, status) = try? await orderRequest("/api/recommendations/phone/result", body: receipt) {
+                if status == 200 {
+                    let decoder = JSONDecoder()
+                    decoder.keyDecodingStrategy = .convertFromSnakeCase
+                    if let speech = try? decoder.decode(NavigationSpeechPacket.self, from: data) {
+                        pickupBluetooth.enqueue(id: receipt.id, data: speech.packet, expiresAt: speech.expiresAt)
+                    }
+                }
+                if status == 200 || status == 409 { settings.removeObject(forKey: recommendationReceiptKey) }
+            }
+            return true
+        }
+        if let card = recommendationCard {
+            if ProcessInfo.processInfo.systemUptime >= card.deadline {
+                recommendationCard = nil
+                var receipt = card.receipt
+                receipt.note = "小屏未确认收到门店资料"
+                storeRecommendationReceipt(receipt)
+            } else if vehicleOrderCardsSupported && !recommendationWritePending {
+                recommendationWritePending = true
+                writeHud(card.text) { [weak self] delivered in
+                    guard let self else { return }
+                    self.recommendationWritePending = false
+                    guard delivered, self.recommendationCard?.receipt.id == card.receipt.id else { return }
+                    self.recommendationCard = nil
+                    var receipt = card.receipt
+                    receipt.shown = true
+                    self.storeRecommendationReceipt(receipt)
+                    NSLog("[knight-recommendation] C3 accepted %@", receipt.id)
+                }
+            } else if CBManager.authorization == .allowedAlways {
+                startHudScan()
+            }
+            return true
+        }
+        guard presentedViewController == nil,
+              let (data, status) = try? await orderRequest("/api/recommendations/phone/claim", body: ["lease": cyclingLease]),
+              status == 200, let claim = try? JSONDecoder().decode(RecommendationClaim.self, from: data) else { return false }
+        recommendationBusy = true
+        var place = claim.destination
+        for region in [claim.city, claim.district] where !region.isEmpty {
+            let prefix = region.replacingOccurrences(of: "[市区县]$", with: "", options: .regularExpression)
+            guard !prefix.isEmpty, place.hasPrefix(prefix) else { continue }
+            place = String(place.dropFirst(place.hasPrefix(region) ? region.count : prefix.count))
+        }
+        phoneSearch.startRecommendation(category: claim.category, destination: claim.city + claim.district + place) { [weak self] result in
+            guard let self else { return }
+            self.recommendationBusy = false
+            switch result {
+            case .success(let store):
+                self.prepareRecommendationCard(claim.id, store: store)
+            case .failure(let error):
+                self.storeRecommendationReceipt(.init(id: claim.id, lease: self.cyclingLease, store: "",
+                                                       dishes: [], shown: false, note: String(error.localizedDescription.prefix(170))))
+            }
+        }
+        return true
+    }
+
+    private func storeRecommendationReceipt(_ receipt: RecommendationReceipt) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(receipt), forKey: recommendationReceiptKey)
+    }
+
+    private func prepareRecommendationCard(_ id: String, store: KnightStoreRecommendation) {
+        let title = store.store.replacingOccurrences(of: "[（(][^）)]*[·•⋅・･]([^）)]+)[）)]$",
+                                                     with: "（$1）", options: .regularExpression)
+        func line(_ value: String) -> String {
+            String(value.filter { !$0.isNewline && $0 != "|" }.prefix(15))
+        }
+        var dishes = store.dishes.filter { $0.utf8.count <= 44 && !$0.contains("|") }
+        if dishes.count == 3 {
+            dishes.sort { $0.utf8.count > $1.utf8.count }
+            if dishes[1].utf8.count + dishes[2].utf8.count + 5 > 48 { dishes.removeLast() }
+        }
+        let details = dishes.dropFirst().joined(separator: " · ")
+        let text = "O:\(id.prefix(8))|\(line(title))|\(line(dishes.first ?? "美团点评高分"))|\(line(details))"
+        let note = String(format: "美团 %.1f 分，距搜索地点约 %d 米", store.score, store.distance)
+        recommendationCard = (.init(id: id, lease: cyclingLease, store: store.store, dishes: dishes,
+                                    shown: false, note: note), text, ProcessInfo.processInfo.systemUptime + 20)
+        if CBManager.authorization == .allowedAlways { startHudScan() }
+    }
+    #endif
+
+    #if DEBUG
     private func sendPickupReceipt(_ receipt: PickupReceipt) async {
-        guard let (data, status) = try? await pickupRequest("/api/delivery/tasks/\(receipt.id)/phone-result", body: receipt) else { return }
+        guard let (data, status) = try? await orderRequest("/api/delivery/tasks/\(receipt.id)/phone-result", body: receipt) else { return }
         if status == 200 || status == 404 || status == 409 {
             if status == 200 {
                 let decoder = JSONDecoder()
@@ -360,12 +720,83 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
                     pickupBluetooth.enqueue(id: receipt.id, data: envelope.packet, expiresAt: envelope.expiresAt)
                 }
                 NSLog("[knight-pickup] phone receipt %@ %@", receipt.id, receipt.state)
+                let item = receipt.quote?.item ?? response?.query ?? "美团自提"
+                let quantity = receipt.quote?.quantity ?? response?.quantity ?? 1
+                if receipt.state == "paused" {
+                    showPickupStatusOnHUD(id: receipt.id, title: "点单已暂停", item: item, detail: "×\(quantity)  导航后续办")
+                } else if let quote = receipt.quote {
+                    showPickupStatusOnHUD(id: receipt.id, title: "自提待付款", item: item,
+                                          detail: String(format: "×%d  ¥%.2f", quantity, Double(quote.totalCents) / 100))
+                } else if receipt.clarification != nil {
+                    showPickupStatusOnHUD(id: receipt.id, title: "等待语音确认", item: item, detail: "×\(quantity)  请听小布")
+                } else {
+                    showPickupStatusOnHUD(id: receipt.id, title: "自提未完成", item: item, detail: "×\(quantity)  查看骑士")
+                }
                 if receipt.clarification == nil, (receipt.voiceRequest ?? response?.voiceRequest) != true,
                    let place = response?.pickupNavigation ?? receipt.navigation {
                     requestPickupMap(place)
                 }
             }
             UserDefaults.standard.removeObject(forKey: pickupReceiptKey)
+        }
+    }
+
+    private func showPickupStatusOnHUD(id: String, title: String, item: String, detail: String) {
+        func displayLine(_ line: String, limit: Int) -> String {
+            String(line.filter { !$0.isNewline && $0 != "|" && !$0.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) }.prefix(limit))
+        }
+        let text = "\(displayLine(title, limit: 8))|\(displayLine(item, limit: 12))|\(displayLine(detail, limit: 14))"
+        let eventID = SHA256.hash(data: Data("\(id)|\(text)".utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+        pickupHUDMessage = "O:\(eventID)|\(text)"
+        if CBManager.authorization == .allowedAlways { startHudScan() }
+        sendPickupStatusToHUD()
+    }
+
+    private func sendPickupStatusToHUD() {
+        guard let card = pickupHUDMessage, !deliveredOrderCards.contains(card), !sendingOrderCards.contains(card) else { return }
+        if hudPeripheral?.name == "ROADLINK-VEHICLE", !vehicleCapabilitiesKnown { return }
+        let message: String
+        if vehicleOrderCardsSupported {
+            message = card
+        } else {
+            guard navigationSpeechSession == nil, vehicleRoute == nil, activePickupMap == nil else { return }
+            let parts = card.split(separator: "|", omittingEmptySubsequences: false)
+            guard parts.count == 4 else { return }
+            message = "D:\(parts[1])|\(parts[2])"
+        }
+        sendingOrderCards.insert(card)
+        writeHud(message) { [weak self] delivered in
+            guard let self else { return }
+            self.sendingOrderCards.remove(card)
+            if delivered {
+                self.deliveredOrderCards.append(card)
+                if self.deliveredOrderCards.count > 48 { self.deliveredOrderCards.removeFirst() }
+                NSLog("[knight-pickup] vehicle order status delivered")
+            }
+        }
+    }
+
+    private func fetchNavigationOrderCards() async {
+        guard navigationSpeechSession != nil,
+              let (data, status) = try? await orderRequest("/api/delivery/tasks", body: [String: String](), method: "GET"),
+              status == 200 else { return }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let list = try? decoder.decode(PickupHUDList.self, from: data) else { return }
+        for task in list.tasks.reversed() where task.updatedAt >= navigationStartedAt {
+            let item = task.quote?.item ?? task.query
+            switch task.state {
+            case "queued": showPickupStatusOnHUD(id: task.id, title: "点单已受理", item: item, detail: "×\(task.quantity)  等待处理")
+            case "preparing": showPickupStatusOnHUD(id: task.id, title: "正在查找自提", item: item, detail: "×\(task.quantity)")
+            case "paused": showPickupStatusOnHUD(id: task.id, title: "点单已暂停", item: item, detail: "×\(task.quantity)  导航后续办")
+            case "pickup_checkout":
+                if let quote = task.quote {
+                    showPickupStatusOnHUD(id: task.id, title: "自提待付款", item: item,
+                                          detail: String(format: "×%d  ¥%.2f", quote.quantity, Double(quote.totalCents) / 100))
+                }
+            case "needs_input": showPickupStatusOnHUD(id: task.id, title: "自提未完成", item: item, detail: "×\(task.quantity)  查看骑士")
+            default: break
+            }
         }
     }
 
@@ -394,7 +825,7 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         }
         let lease = defaults.string(forKey: pickupClaimKey) ?? UUID().uuidString.lowercased()
         defaults.set(lease, forKey: pickupClaimKey)
-        guard let (data, status) = try? await pickupRequest("/api/delivery/phone/claim", body: ["lease": lease]), status == 200 else {
+        guard let (data, status) = try? await orderRequest("/api/delivery/phone/claim", body: ["lease": lease]), status == 200 else {
             pickupBusy = false
             return
         }
@@ -412,7 +843,9 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
         if task.voiceRequest == true {
             webView?.evaluateJavaScript("window.dispatchEvent(new Event('knight-voice-task'))", completionHandler: nil)
         }
-        if CBManager.authorization == .allowedAlways { startHudScan() }
+        if CBManager.authorization == .allowedAlways {
+            showPickupStatusOnHUD(id: task.id, title: "正在查找自提", item: task.query, detail: "×\(task.quantity)")
+        }
         phoneSearch.startPickup(task) { [weak self] result in
             guard let self else { return }
             let receipt: PickupReceipt
@@ -423,6 +856,10 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
             case .stopped(let note, let navigation, let clarification, let cartAdded):
                 receipt = PickupReceipt(id: task.id, lease: lease, state: "needs_input", note: String(note.prefix(180)), quote: nil, navigation: navigation, clarification: clarification, cartAdded: cartAdded, voiceRequest: task.voiceRequest)
                 NSLog("[knight-pickup] stopped %@", note)
+            case .paused(let routeID, let navigation):
+                receipt = PickupReceipt(id: task.id, lease: lease, state: "paused", note: "导航结束后自动续办", quote: nil,
+                                        navigation: navigation, clarification: nil, cartAdded: false, voiceRequest: task.voiceRequest,
+                                        pausedForRoute: routeID)
             }
             defaults.set(try? JSONEncoder().encode(receipt), forKey: self.pickupReceiptKey)
             await self.sendPickupReceipt(receipt)
@@ -431,7 +868,7 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     }
 
     private func startClaimedVoiceRide() async -> Bool {
-        guard let (data, status) = try? await pickupRequest("/api/delivery/phone/ride-claim", body: ["lease": rideVoiceLease]),
+        guard let (data, status) = try? await orderRequest("/api/delivery/phone/ride-claim", body: ["lease": rideVoiceLease]),
               status == 200, let claim = try? JSONDecoder().decode(RideVoiceClaim.self, from: data) else { return false }
         let report: (Bool, String) -> Void = { [weak self] started, detail in
             guard let self else { return }
@@ -451,7 +888,7 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     }
 
     private func sendRideVoiceReceipt(_ receipt: RideVoiceReceipt) async {
-        guard let (_, status) = try? await pickupRequest("/api/delivery/tasks/\(receipt.id)/ride-result", body: receipt),
+        guard let (_, status) = try? await orderRequest("/api/delivery/tasks/\(receipt.id)/ride-result", body: receipt),
               [200, 404, 409].contains(status) else { return }
         UserDefaults.standard.removeObject(forKey: rideReceiptKey)
     }
@@ -714,22 +1151,206 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     }
 
     private func presentRide(name: String, city: String?, address: String?, destination: KnightMapPlace?, key: String,
+                             ordinaryRequest: Bool = false, district: String? = nil,
+                             recommendedStore: Bool = false,
                              voiceStartResult: ((Bool, String) -> Void)? = nil) {
+        clearVehicleRoute()
         startHudScan()
         updateRideHUD(turn: "路线规划", detail: "请看手机")
         let controller = KnightRideNavigation(store: name, city: city, address: address, key: key) { [weak self] turn, detail in
             self?.updateRideHUD(turn: turn, detail: detail)
         }
         controller.destination = destination
+        controller.ordinaryRequest = ordinaryRequest
+        controller.recommendedStore = recommendedStore
+        controller.destinationDistrict = district
         controller.voiceStartResult = voiceStartResult
+        controller.vehicleRouteUpdate = { [weak self] points in self?.updateVehicleRoute(points) }
+        controller.vehiclePositionUpdate = { [weak self] coordinate, remainingMeters in
+            self?.updateVehiclePosition(coordinate, remainingMeters: remainingMeters)
+        }
+        controller.navigationDidStart = { [weak self] in self?.startNavigationSpeech() }
         present(controller, animated: true)
     }
 
     private func updateRideHUD(turn: String, detail: String) {
+        let ended = turn == "导航结束" || turn == "已到达" || turn == "算路未完成"
+        if ended {
+            stopNavigationSpeech(arrived: turn == "已到达")
+            clearVehicleRoute()
+        } else {
+            announceNavigationTurn(turn, detail: detail)
+        }
+        if let id = ordinaryRouteID, ordinaryRouteStarted {
+            if ended {
+                queueCyclingReceipt(id, state: "ended", note: turn)
+                UserDefaults.standard.removeObject(forKey: cyclingActiveRouteKey)
+                ordinaryRouteID = nil
+                ordinaryRouteStarted = false
+            } else if !ordinaryReportedInstruction, detail.hasSuffix("米") || detail.hasSuffix("公里") {
+                ordinaryReportedInstruction = true
+                queueCyclingReceipt(id, state: "active", note: "高德 GPS 骑行导航已启动。\(turn) \(detail)")
+            }
+        }
         rideHUDMessage = "D:\(turn)|\(detail.isEmpty ? "导航中" : detail)"
         rideHUDExpiresAt = detail.hasSuffix("米") || detail.hasSuffix("公里")
             ? ProcessInfo.processInfo.systemUptime + 15 : nil
         sendLatestRideHUD()
+    }
+
+    private func startNavigationSpeech() {
+        navigationSpeechSession = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
+        navigationSpeechSequence = 0
+        lastNavigationSpeechTurn = nil
+        lastNavigationSpeechBucket = nil
+        currentNavigationSpeech = nil
+        navigationStartedAt = Int(Date().timeIntervalSince1970)
+        sendNavigationSpeech("start")
+        navigationSpeechTimer?.invalidate()
+        let timer = Timer(timeInterval: 6, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            Task { @MainActor in
+                self.sendNavigationSpeech("keep")
+                #if DEBUG
+                await self.fetchNavigationOrderCards()
+                #endif
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        navigationSpeechTimer = timer
+    }
+
+    private func stopNavigationSpeech(arrived: Bool) {
+        sendNavigationSpeech("end", arrived: arrived)
+        navigationSpeechSession = nil
+        currentNavigationSpeech = nil
+        navigationSpeechTimer?.invalidate()
+        navigationSpeechTimer = nil
+    }
+
+    private func announceNavigationTurn(_ turn: String, detail: String) {
+        guard navigationSpeechSession != nil else { return }
+        let kilometers = detail.hasSuffix("公里")
+        guard kilometers || detail.hasSuffix("米"),
+              let distance = Double(detail.dropLast(kilometers ? 2 : 1)), distance.isFinite else { return }
+        let meters = distance * (kilometers ? 1000 : 1)
+        let bucket = meters <= 20 ? 0 : meters <= 80 ? 1 : 2
+        currentNavigationSpeech = (turn, detail, ProcessInfo.processInfo.systemUptime)
+        guard turn != lastNavigationSpeechTurn || bucket != lastNavigationSpeechBucket else { return }
+        lastNavigationSpeechTurn = turn
+        lastNavigationSpeechBucket = bucket
+        sendNavigationSpeech("step", turn: turn, distance: detail)
+    }
+
+    private func refreshNavigationSpeech() {
+        guard navigationSpeechSession != nil,
+              let guide = currentNavigationSpeech,
+              ProcessInfo.processInfo.systemUptime - guide.updatedAt < 12 else { return }
+        sendNavigationSpeech("start")
+        sendNavigationSpeech("step", turn: guide.turn, distance: guide.distance)
+    }
+
+    private func sendNavigationSpeech(_ kind: String, turn: String? = nil, distance: String? = nil, arrived: Bool = false) {
+        guard let session = navigationSpeechSession, ordersConfig != nil else { return }
+        navigationSpeechSequence += 1
+        let request = NavigationSpeechRequest(session: session, kind: kind, sequence: navigationSpeechSequence,
+                                              turn: turn, distance: distance, arrived: arrived)
+        Task { @MainActor [weak self] in
+            guard let self, let (data, status) = try? await self.orderRequest("/api/cycling/phone/navigation-speech", body: request),
+                  status == 200, kind == "end" ? self.navigationSpeechSession == nil : self.navigationSpeechSession == session
+                  else { return }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            guard let envelope = try? decoder.decode(NavigationSpeechPacket.self, from: data) else { return }
+            self.pickupBluetooth.enqueue(id: "\(session)-\(request.sequence)", data: envelope.packet,
+                                         expiresAt: envelope.expiresAt, navigationKind: kind)
+        }
+    }
+
+    private func relayVoiceRequest(_ packet: Data, id: String) async {
+        guard let (data, status) = try? await orderRequest("/api/voice/phone/relay", body: ["packet": packet]),
+              status == 200 else {
+            NSLog("[knight-pickup] Voice request relay failed")
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let response = try? decoder.decode(NavigationSpeechPacket.self, from: data) else { return }
+        NSLog("[knight-pickup] Forwarded Bluetooth voice request %@", String(id.prefix(8)))
+        pickupBluetooth.enqueue(id: "relay-\(id)", data: response.packet, expiresAt: response.expiresAt, isRelayAck: true)
+    }
+
+    private func updateVehicleRoute(_ points: [CLLocation]) {
+        guard let route = KnightVehicleRoute(points) else {
+            clearVehicleRoute()
+            return
+        }
+        vehicleRoute = route
+        vehiclePosition = nil
+        lastVehiclePositionAt = 0
+        if vehicleHeartbeat == nil {
+            let timer = Timer(timeInterval: 8, repeats: true) { [weak self] timer in
+                guard let self else { timer.invalidate(); return }
+                Task { @MainActor in self.sendLatestVehicleRoute() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            vehicleHeartbeat = timer
+        }
+        sendLatestVehicleRoute()
+    }
+
+    private func updateVehiclePosition(_ coordinate: CLLocationCoordinate2D, remainingMeters: Int) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastVehiclePositionAt >= 1,
+              let message = vehicleRoute?.position(coordinate, remainingMeters: remainingMeters) else { return }
+        lastVehiclePositionAt = now
+        vehiclePosition = message
+        sendLatestVehicleRoute()
+    }
+
+    private func clearVehicleRoute() {
+        vehicleHeartbeat?.invalidate()
+        vehicleHeartbeat = nil
+        if let route = vehicleRoute { pendingVehicleClear = "C:\(route.id)" }
+        vehicleRoute = nil
+        vehiclePosition = nil
+        sendLatestVehicleRoute()
+    }
+
+    private func sendLatestVehicleRoute() {
+        guard vehicleRouteSupported, !vehicleWriting, hudPeripheral?.state == .connected,
+              rxChar != nil, txChar?.isNotifying == true else { return }
+        let message: String
+        if let clear = pendingVehicleClear {
+            message = clear
+        } else if let route = vehicleRoute, route.id != sentVehicleRouteID {
+            message = "R:\(route.id)|\(route.points)"
+        } else if let position = vehiclePosition, sentVehiclePosition != position {
+            message = position
+        } else if let route = vehicleRoute, ProcessInfo.processInfo.systemUptime - lastVehicleActivityAt >= 7 {
+            message = "K:\(route.id)"
+        } else {
+            return
+        }
+        vehicleWriting = true
+        let generation = vehicleWriteGeneration
+        writeHud(message) { [weak self] delivered in
+            guard let self, self.vehicleWriteGeneration == generation else { return }
+            self.vehicleWriting = false
+            guard delivered else { return }
+            self.lastVehicleActivityAt = ProcessInfo.processInfo.systemUptime
+            if message.hasPrefix("R:") {
+                self.sentVehicleRouteID = String(message.dropFirst(2).prefix(8))
+                self.sentVehiclePosition = nil
+            } else if message == self.pendingVehicleClear {
+                self.pendingVehicleClear = nil
+                self.sentVehicleRouteID = nil
+                self.sentVehiclePosition = nil
+            } else if message.hasPrefix("L:") {
+                self.sentVehiclePosition = message
+            }
+            self.sendLatestVehicleRoute()
+        }
     }
 
     private func sendLatestRideHUD() {
@@ -775,20 +1396,28 @@ final class KnightWebViewController: UIViewController, WKNavigationDelegate, WKU
     deinit {
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "knightNative")
         scanTimer?.invalidate()
+        phonePoll?.invalidate()
+        vehicleHeartbeat?.invalidate()
+        navigationSpeechTimer?.invalidate()
         if let pickupMapObserver { NotificationCenter.default.removeObserver(pickupMapObserver) }
     }
 }
 
-#if DEBUG
 private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private struct Pending: Codable {
         let id: String
         let data: Data
         let expiresAt: Int
+        let navigationKind: String?
+        let relayAck: Bool?
     }
 
     private let service = CBUUID(string: "A7076F10-DB65-42FE-BC32-773B93A0E331")
     private let link = CBUUID(string: "A7076F11-DB65-42FE-BC32-773B93A0E331")
+    private let uplink = CBUUID(string: "A7076F12-DB65-42FE-BC32-773B93A0E331")
+    private let hidService = CBUUID(string: "1812")
+    var onReady: (() -> Void)?
+    var onVoiceRequest: ((Data, String) -> Void)?
     private let outboxKey = "knight.pickup.bluetooth.outbox"
     private var central: CBCentralManager?
     private var board: CBPeripheral?
@@ -798,46 +1427,89 @@ private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, C
     private var sequence = 0
     private var inFlight = 0
     private var handshakePending = false
+    private var relayBuffer = Data()
+    private var relaySequence = 0
+    private var discoveryStartedAt: TimeInterval?
 
     func start() {
         guard central == nil else { return }
         if let stored = UserDefaults.standard.data(forKey: outboxKey) {
             outbox = (try? JSONDecoder().decode([Pending].self, from: stored)) ?? []
         }
-        central = CBCentralManager(delegate: self, queue: .main, options: [
-            CBCentralManagerOptionRestoreIdentifierKey: "com.knight.pickup.bluetooth"
+        let manager = CBCentralManager(delegate: self, queue: .main, options: [
+            CBCentralManagerOptionRestoreIdentifierKey: "com.knight.pickup.bluetooth.v3"
         ])
+        central = manager
+        lookForBoard(on: manager)
+        _ = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] timer in
+            guard let self, let central = self.central else { timer.invalidate(); return }
+            if let board = self.board, let started = self.discoveryStartedAt,
+               ProcessInfo.processInfo.systemUptime - started >= 8 {
+                self.board = nil
+                self.resetTransmission()
+                central.cancelPeripheralConnection(board)
+                self.scanForBoard(on: central)
+            } else {
+                self.lookForBoard(on: central)
+            }
+        }
     }
 
-    func enqueue(id: String, data: Data, expiresAt: Int) {
+    func enqueue(id: String, data: Data, expiresAt: Int, navigationKind: String? = nil, isRelayAck: Bool = false) {
         start()
+        if let central { lookForBoard(on: central) }
         guard data.count > 70, data.count <= 2048, !outbox.contains(where: { $0.id == id }) else { return }
-        outbox.append(Pending(id: id, data: data, expiresAt: expiresAt))
+        let packet = Pending(id: id, data: data, expiresAt: expiresAt,
+                             navigationKind: navigationKind, relayAck: isRelayAck ? true : nil)
+        let first = (offset > 0 || inFlight > 0) && !outbox.isEmpty ? 1 : 0
+        if isRelayAck {
+            outbox.insert(packet, at: first)
+        } else if let navigationKind {
+            let queued = outbox[first...].filter {
+                navigationKind == "end" ? $0.navigationKind == nil : $0.navigationKind != navigationKind
+            }
+            let acknowledgments = queued.prefix { $0.relayAck == true }
+            outbox = Array(outbox.prefix(first)) + acknowledgments + [packet] + queued.dropFirst(acknowledgments.count)
+        } else {
+            outbox.append(packet)
+        }
         persist()
         sendNext()
     }
 
     private func persist() {
-        UserDefaults.standard.set(try? JSONEncoder().encode(outbox), forKey: outboxKey)
+        UserDefaults.standard.set(try? JSONEncoder().encode(outbox.filter {
+            $0.navigationKind == nil && $0.relayAck != true
+        }), forKey: outboxKey)
     }
 
     private func connect(_ peripheral: CBPeripheral, on central: CBCentralManager) {
         board = peripheral
         peripheral.delegate = self
-        if peripheral.state == .connected {
-            peripheral.discoverServices([service])
-        } else if peripheral.state != .connecting {
+        discoveryStartedAt = ProcessInfo.processInfo.systemUptime
+        if peripheral.state != .connecting {
+            // A system HID connection still needs a local Core Bluetooth connection for this app.
             central.connect(peripheral)
         }
     }
 
-    private func lookForBoard() {
-        guard let central, central.state == .poweredOn, board == nil else { return }
-        if let connected = central.retrieveConnectedPeripherals(withServices: [service]).first {
+    private func lookForBoard(on central: CBCentralManager) {
+        guard central.state == .poweredOn, board == nil else { return }
+        let connectedVoice = central.retrieveConnectedPeripherals(withServices: [service]).first
+        let connectedPointer = central.retrieveConnectedPeripherals(withServices: [hidService])
+            .first { $0.name == "Knight Pointer" }
+        if let connected = connectedVoice ?? connectedPointer {
+            NSLog("[knight-pickup] Reusing connected feedback peripheral")
             connect(connected, on: central)
-        } else if !central.isScanning {
-            central.scanForPeripherals(withServices: [service])
+        } else {
+            scanForBoard(on: central)
         }
+    }
+
+    private func scanForBoard(on central: CBCentralManager) {
+        guard central.state == .poweredOn, !central.isScanning else { return }
+        NSLog("[knight-pickup] Scanning for feedback peripheral")
+        central.scanForPeripherals(withServices: [service])
     }
 
     private func resetTransmission() {
@@ -846,6 +1518,9 @@ private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, C
         sequence = 0
         inFlight = 0
         handshakePending = false
+        relayBuffer.removeAll()
+        relaySequence = 0
+        discoveryStartedAt = nil
     }
 
     private func sendNext() {
@@ -869,8 +1544,10 @@ private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, C
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        NSLog("[knight-pickup] Feedback Bluetooth state %d", central.state.rawValue)
         if central.state == .poweredOn {
-            lookForBoard()
+            if let board, board.state == .disconnected { connect(board, on: central) }
+            lookForBoard(on: central)
         } else {
             board = nil
             resetTransmission()
@@ -881,18 +1558,25 @@ private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, C
         if let peripheral = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral])?.first {
             board = peripheral
             peripheral.delegate = self
+            discoveryStartedAt = ProcessInfo.processInfo.systemUptime
             if peripheral.state == .connected { peripheral.discoverServices([service]) }
+            else if central.state == .poweredOn { connect(peripheral, on: central) }
         }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard board == nil else { return }
+        NSLog("[knight-pickup] Discovered feedback peripheral")
         central.stopScan()
         connect(peripheral, on: central)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard board?.identifier == peripheral.identifier else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         peripheral.discoverServices([service])
     }
 
@@ -904,37 +1588,57 @@ private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, C
         guard board?.identifier == peripheral.identifier else { return }
         board = nil
         resetTransmission()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.lookForBoard() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.lookForBoard(on: central) }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let match = peripheral.services?.first(where: { $0.uuid == service }), error == nil else {
+            NSLog("[knight-pickup] Feedback service discovery failed (%d)", (error as NSError?)?.code ?? 0)
             central?.cancelPeripheralConnection(peripheral)
             return
         }
-        peripheral.discoverCharacteristics([link], for: match)
+        peripheral.discoverCharacteristics(nil, for: match)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        guard invalidatedServices.contains(where: { $0.uuid == service }) else { return }
+        resetTransmission()
+        discoveryStartedAt = ProcessInfo.processInfo.systemUptime
+        peripheral.discoverServices([service])
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard let match = service.characteristics?.first(where: { $0.uuid == link && $0.properties.contains(.write) }),
               error == nil else {
+            NSLog("[knight-pickup] Feedback characteristic discovery failed (%d)", (error as NSError?)?.code ?? 0)
             central?.cancelPeripheralConnection(peripheral)
             return
         }
         characteristic = match
+        if let source = service.characteristics?.first(where: { $0.uuid == uplink && $0.properties.contains(.indicate) }) {
+            peripheral.setNotifyValue(true, for: source)
+        } else {
+            NSLog("[knight-pickup] Voice relay characteristic unavailable")
+        }
         handshakePending = true
         peripheral.writeValue(Data([0x80, 0]), for: match, type: .withResponse)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         guard board?.identifier == peripheral.identifier, characteristic.uuid == link else { return }
-        guard error == nil else {
+        if let error = error as NSError? {
+            NSLog("[knight-pickup] Feedback Bluetooth write failed (%d)", error.code)
             central?.cancelPeripheralConnection(peripheral)
             return
         }
         if handshakePending {
             handshakePending = false
+            discoveryStartedAt = nil
             NSLog("[knight-pickup] Bluetooth feedback channel ready")
+            let now = Int(Date().timeIntervalSince1970)
+            if !outbox.contains(where: { $0.navigationKind == "step" && $0.expiresAt > now }) {
+                onReady?()
+            }
             sendNext()
             return
         }
@@ -951,9 +1655,37 @@ private final class KnightPickupBluetooth: NSObject, CBCentralManagerDelegate, C
         }
         sendNext()
     }
-}
-#endif
 
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard board?.identifier == peripheral.identifier, characteristic.uuid == uplink,
+              error == nil, let frame = characteristic.value, frame.count >= 3 else { return }
+        let flags = frame[0]
+        let index = Int(frame[1])
+        if flags & 1 != 0 {
+            relayBuffer.removeAll()
+            relaySequence = 0
+        }
+        guard flags & 0xfc == 0, index == relaySequence, (flags & 1 != 0) == (relaySequence == 0),
+              relayBuffer.count + frame.count - 2 <= 1200 else {
+            relayBuffer.removeAll()
+            relaySequence = 0
+            return
+        }
+        relayBuffer.append(contentsOf: frame.dropFirst(2))
+        relaySequence += 1
+        guard flags & 2 != 0 else { return }
+        let packet = relayBuffer
+        relayBuffer.removeAll()
+        relaySequence = 0
+        guard packet.count >= 71, let id = String(data: packet[2..<34], encoding: .ascii) else { return }
+        onVoiceRequest?(packet, id)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        guard characteristic.uuid == uplink else { return }
+        NSLog("[knight-pickup] Voice relay subscription %@", error == nil && characteristic.isNotifying ? "ready" : "failed")
+    }
+}
 // MARK: - CBCentralManagerDelegate / CBPeripheralDelegate
 extension KnightWebViewController: CBCentralManagerDelegate, CBPeripheralDelegate {
 
@@ -974,8 +1706,16 @@ extension KnightWebViewController: CBCentralManagerDelegate, CBPeripheralDelegat
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? ""
         let hasService = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?.contains(hudServiceUUID) ?? false
-        guard hasService || name.contains("ROADLINK") || name.contains("Knight") else { return }
-        connect(peripheral)
+        guard wantConnect, hudPeripheral?.state != .connected, hudPeripheral?.state != .connecting else { return }
+        if name == "ROADLINK-VEHICLE" {
+            connect(peripheral)
+        } else if name == "ROADLINK-HUD" || (hasService && name.hasPrefix("Knight")) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self, self.wantConnect, self.hudPeripheral?.state != .connected,
+                      self.hudPeripheral?.state != .connecting else { return }
+                self.connect(peripheral)
+            }
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -994,6 +1734,16 @@ extension KnightWebViewController: CBCentralManagerDelegate, CBPeripheralDelegat
         rxChar = nil
         txChar = nil
         deliveredRideHUDMessage = nil
+        vehicleWriteGeneration += 1
+        vehicleRouteSupported = false
+        vehicleOrderCardsSupported = false
+        vehicleCapabilitiesKnown = false
+        #if DEBUG
+        deliveredOrderCards.removeAll()
+        #endif
+        vehicleWriting = false
+        sentVehicleRouteID = nil
+        sentVehiclePosition = nil
         writing = false
         let cancelled = txQueue
         txQueue.removeAll()
@@ -1018,18 +1768,36 @@ extension KnightWebViewController: CBCentralManagerDelegate, CBPeripheralDelegat
             } else if c.uuid == hudTxUUID {
                 txChar = c
                 peripheral.setNotifyValue(true, for: c)
+                if peripheral.name == "ROADLINK-VEHICLE" { peripheral.readValue(for: c) }
             }
         }
         if rxChar != nil && txChar != nil {
             hudEvent("V,native-corebluetooth")
+            sendLatestVehicleRoute()
             if rideHUDMessage != nil { sendLatestRideHUD() }
             else if let place = activePickupMap { writeHud(place.hudMessage) }
+            #if DEBUG
+            sendPickupStatusToHUD()
+            #endif
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard characteristic.uuid == hudTxUUID, let data = characteristic.value else { return }
         if let text = String(data: data, encoding: .utf8) {
+            if peripheral.name == "ROADLINK-VEHICLE", text.hasPrefix("V,vehicle-c3/") {
+                vehicleCapabilitiesKnown = true
+                vehicleRouteSupported = text.hasPrefix("V,vehicle-c3/2.")
+                let minor = text.split(separator: ".").last.flatMap { Int($0) } ?? 0
+                vehicleOrderCardsSupported = vehicleRouteSupported && minor >= 2
+                sendLatestVehicleRoute()
+                #if DEBUG
+                sendPickupStatusToHUD()
+                #endif
+            }
+            if peripheral.name == "ROADLINK-VEHICLE", text.hasPrefix("A:R"), vehicleRoute?.id == String(text.dropFirst(3)) {
+                NSLog("[knight-ride] vehicle screen accepted route %@", String(text.dropFirst(3)))
+            }
             hudEvent(text)
         }
     }
@@ -1048,6 +1816,8 @@ extension KnightWebViewController: CBCentralManagerDelegate, CBPeripheralDelegat
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         if error != nil {
             hudEvent("E:订阅通知失败")
+        } else if characteristic.uuid == hudTxUUID, characteristic.isNotifying {
+            sendLatestVehicleRoute()
         }
     }
 }

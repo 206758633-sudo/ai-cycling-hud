@@ -22,6 +22,15 @@ static NSString *cityKey(NSString *text) {
     return [value hasSuffix:@"市"] ? [value substringToIndex:value.length - 1] : value;
 }
 
+static NSArray<NSString *> *storeIdentity(NSString *name) {
+    NSArray<NSString *> *parts = [name componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"(（)）"]];
+    if (parts.count < 3) return @[];
+    NSArray<NSString *> *labels = [parts[1] componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"·•⋅・･"]];
+    NSString *branch = placeKey(labels.lastObject);
+    if (![branch hasSuffix:@"店"] || branch.length < 3 || !placeKey(parts.firstObject).length) return @[];
+    return @[parts.firstObject, branch];
+}
+
 static NSString *turnText(AMapNaviIconType type) {
     switch (type) {
         case AMapNaviIconTypeLeft: return @"左转";
@@ -58,13 +67,20 @@ static NSString *distanceText(NSInteger meters) {
 }
 
 @interface KnightRideMap : AMapNaviRideView
-@property (nonatomic, copy, nullable) void (^onGuidance)(AMapNaviIconType, NSInteger);
+@property (nonatomic, copy, nullable) void (^onGuidance)(AMapNaviIconType, NSInteger, NSInteger);
+@property (nonatomic, copy, nullable) void (^onPosition)(CLLocationCoordinate2D);
 @end
 
 @implementation KnightRideMap
 - (void)rideManager:(AMapNaviRideManager *)rideManager updateNaviInfo:(AMapNaviInfo *)info {
     [super rideManager:rideManager updateNaviInfo:info];
-    if (info && self.onGuidance) self.onGuidance(info.iconType, info.segmentRemainDistance);
+    if (info && self.onGuidance) self.onGuidance(info.iconType, info.segmentRemainDistance, info.routeRemainDistance);
+}
+
+- (void)rideManager:(AMapNaviRideManager *)rideManager updateNaviLocation:(AMapNaviLocation *)location {
+    [super rideManager:rideManager updateNaviLocation:location];
+    AMapNaviPoint *point = location.coordinate;
+    if (point && self.onPosition) self.onPosition(CLLocationCoordinate2DMake(point.latitude, point.longitude));
 }
 @end
 
@@ -82,6 +98,7 @@ static NSString *distanceText(NSInteger meters) {
 @property (nonatomic, strong) AMapNaviRideManager *ride;
 @property (nonatomic, strong) KnightRideMap *map;
 @property (nonatomic, strong, nullable) MAMapView *routePreview;
+@property (nonatomic) NSInteger routeRemainingMeters;
 @property (nonatomic, strong) UIView *mapHost;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic, strong) UIButton *startButton;
@@ -167,7 +184,7 @@ static NSString *distanceText(NSInteger meters) {
     }
     if (self.voiceStartResult) {
         [self fail:@"需要先在骑士同意高德定位与轨迹说明"];
-        [self dismissViewControllerAnimated:YES completion:nil];
+        if (!self.ordinaryRequest) [self dismissViewControllerAnimated:YES completion:nil];
         return;
     }
     UIAlertController *consent = [UIAlertController alertControllerWithTitle:@"高德骑行导航"
@@ -221,8 +238,8 @@ static NSString *distanceText(NSInteger meters) {
                 [self fail:@"请在 iPhone 定位设置开启精确位置后重试"];
             } else if (!self.requestedLocation) {
                 self.requestedLocation = YES;
-                [self setTimeout:18 text:@"暂时无法定位，请到开阔处重试"];
-                [manager requestLocation];
+                [self setTimeout:25 text:@"未取得足够精确的当前位置，请到开阔处重试"];
+                [manager startUpdatingLocation];
             }
             break;
         default:
@@ -232,14 +249,21 @@ static NSString *distanceText(NSInteger meters) {
 }
 
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
-    if (self.stage != KnightRideLocating) return;
-    CLLocation *location = locations.lastObject;
-    if (!location || location.horizontalAccuracy < 0 || location.horizontalAccuracy > 150
-        || fabs(location.timestamp.timeIntervalSinceNow) > 25) {
-        [self fail:@"当前位置精度不足，请到开阔处重试"];
+    if (self.stage != KnightRideLocating || manager != self.locationManager) return;
+    CLLocation *fix = nil;
+    for (CLLocation *location in locations.reverseObjectEnumerator) {
+        if (location.horizontalAccuracy >= 0 && location.horizontalAccuracy <= 150
+            && fabs(location.timestamp.timeIntervalSinceNow) <= 25 && CLLocationCoordinate2DIsValid(location.coordinate)) {
+            fix = location;
+            break;
+        }
+    }
+    if (!fix) {
+        self.status.text = @"正在等待更准确的骑行起点";
         return;
     }
-    self.origin = AMapCoordinateConvert(location.coordinate, AMapCoordinateTypeGPS);
+    [manager stopUpdatingLocation];
+    self.origin = AMapCoordinateConvert(fix.coordinate, AMapCoordinateTypeGPS);
     self.locationManager.delegate = nil;
     self.locationManager = nil;
     KnightConfigureMapSDK(self.key);
@@ -248,21 +272,28 @@ static NSString *distanceText(NSInteger meters) {
 }
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error {
-    if (self.stage == KnightRideLocating) [self fail:@"暂时无法定位，请到开阔处重试"];
+    if (self.stage != KnightRideLocating || manager != self.locationManager) return;
+    if ([error.domain isEqualToString:kCLErrorDomain] && error.code == kCLErrorLocationUnknown) return;
+    [self fail:@"暂时无法定位，请检查定位权限后重试"];
 }
 
 - (void)resolveDestination {
     self.stage = KnightRideResolving;
-    self.status.text = @"正在核对高德地图上的自提门店";
+    self.status.text = self.ordinaryRequest ? @"正在高德搜索目的地" : @"正在核对高德地图上的自提门店";
     self.search = [[AMapSearchAPI alloc] init];
     self.search.delegate = self;
     self.request = [[AMapPOIKeywordsSearchRequest alloc] init];
     self.request.keywords = self.store;
+    if (self.recommendedStore) {
+        NSArray<NSString *> *identity = storeIdentity(self.store);
+        if (identity.count == 2) self.request.keywords = identity.firstObject;
+        self.request.offset = 25;
+    }
     if (self.city.length) {
         self.request.city = self.city;
         self.request.cityLimit = YES;
     }
-    [self setTimeout:18 text:@"高德门店搜索超时，请检查网络后重试"];
+    [self setTimeout:18 text:@"高德地点搜索超时，请检查网络后重试"];
     [self.search AMapPOIKeywordsSearch:self.request];
 }
 
@@ -271,10 +302,19 @@ static NSString *distanceText(NSInteger meters) {
     NSString *store = placeKey(self.store);
     NSString *city = cityKey(self.city);
     NSString *address = placeKey(self.address);
+    NSString *district = placeKey(self.destinationDistrict);
+    NSArray<NSString *> *identity = self.recommendedStore ? storeIdentity(self.store) : @[];
     NSMutableDictionary<NSString *, AMapPOI *> *matches = [NSMutableDictionary dictionary];
     for (AMapPOI *poi in response.pois) {
-        if (![placeKey(poi.name) isEqualToString:store] || !poi.uid.length || !poi.location) continue;
+        BOOL nameMatches = [placeKey(poi.name) isEqualToString:store];
+        if (!nameMatches && identity.count == 2) {
+            NSArray<NSString *> *candidate = storeIdentity(poi.name);
+            nameMatches = candidate.count == 2 && [placeKey(candidate.firstObject) isEqualToString:placeKey(identity.firstObject)] &&
+                          [candidate.lastObject hasSuffix:identity.lastObject];
+        }
+        if (!nameMatches || !poi.uid.length || !poi.location) continue;
         if (city.length && ![cityKey(poi.city) isEqualToString:city]) continue;
+        if (district.length && ![placeKey(poi.district) isEqualToString:district]) continue;
         if (address.length) {
             NSString *poiAddress = placeKey(poi.address);
             if (address.length < 6 || poiAddress.length < 6 ||
@@ -285,7 +325,8 @@ static NSString *distanceText(NSInteger meters) {
         matches[poi.uid] = poi;
     }
     if (matches.count != 1) {
-        [self fail:@"高德地图未找到唯一匹配的分店。请在美团核对取餐地址"];
+        [self fail:self.ordinaryRequest ? @"高德未找到唯一目的地，请核对城市、区和地名" :
+                    @"高德地图未找到唯一匹配的分店。请在美团核对取餐地址"];
         return;
     }
     AMapGeoPoint *location = matches.allValues.firstObject.location;
@@ -313,9 +354,19 @@ static NSString *distanceText(NSInteger meters) {
     self.map.hidden = YES;
     self.map.delegate = self;
     __weak typeof(self) weakSelf = self;
-    self.map.onGuidance = ^(AMapNaviIconType type, NSInteger meters) {
+    self.map.onGuidance = ^(AMapNaviIconType type, NSInteger meters, NSInteger remainingMeters) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.routeRemainingMeters = remainingMeters;
             [weakSelf receiveInstruction:turnText(type) distance:distanceText(meters)];
+        });
+    };
+    self.map.onPosition = ^(CLLocationCoordinate2D coordinate) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            KnightRideNavigation *strongSelf = weakSelf;
+            if (strongSelf.stage == KnightRideActive && strongSelf.vehiclePositionUpdate &&
+                CLLocationCoordinate2DIsValid(coordinate) && (coordinate.latitude || coordinate.longitude)) {
+                strongSelf.vehiclePositionUpdate(coordinate, strongSelf.routeRemainingMeters);
+            }
         });
     };
     self.map.showMoreButton = NO;
@@ -330,6 +381,7 @@ static NSString *distanceText(NSInteger meters) {
 
 - (void)rideManagerOnCalculateRouteSuccess:(AMapNaviRideManager *)rideManager {
     if (self.stage == KnightRideActive && self.recalculating) {
+        [self publishVehicleRoute:rideManager.naviRoute];
         self.recalculating = NO;
         self.status.text = @"新路线已规划，正在更新指引";
         self.guidance(@"等待指引", @"新路线");
@@ -344,9 +396,23 @@ static NSString *distanceText(NSInteger meters) {
     [self.timeout invalidate];
     self.stage = KnightRideReady;
     NSInteger meters = route.routeLength;
+    [self publishVehicleRoute:route];
     self.status.text = [NSString stringWithFormat:@"骑行路线 %@。确认目的地后开始", distanceText(meters)];
     self.startButton.enabled = YES;
     if (self.voiceStartResult) [self startRide];
+}
+
+- (void)publishVehicleRoute:(AMapNaviRoute *)route {
+    if (!self.vehicleRouteUpdate) return;
+    NSMutableArray<CLLocation *> *points = [NSMutableArray array];
+    for (AMapNaviPoint *point in route.routeCoordinates) {
+        CLLocationCoordinate2D value = CLLocationCoordinate2DMake(point.latitude, point.longitude);
+        if (CLLocationCoordinate2DIsValid(value) && (value.latitude || value.longitude)) {
+            [points addObject:[[CLLocation alloc] initWithLatitude:value.latitude longitude:value.longitude]];
+        }
+    }
+    self.routeRemainingMeters = route.routeLength;
+    self.vehicleRouteUpdate(points);
 }
 
 - (BOOL)showPreviewForRoute:(AMapNaviRoute *)route {
@@ -430,6 +496,7 @@ static NSString *distanceText(NSInteger meters) {
     self.stage = KnightRideActive;
     [self.timeout invalidate];
     [self reportVoiceStart:YES detail:@""];
+    if (self.navigationDidStart) self.navigationDidStart();
     [self.routePreview removeFromSuperview];
     self.routePreview = nil;
     self.map.hidden = NO;
@@ -475,8 +542,9 @@ static NSString *distanceText(NSInteger meters) {
     if (self.stage != KnightRideActive) return;
     self.stage = KnightRideArrived;
     [self stopSDK];
-    self.status.text = self.destination ? @"已到达骑行目的地" : @"已到达自提门店";
-    self.guidance(@"已到达", self.destination ? @"目的地" : @"自提门店");
+    BOOL ordinary = self.destination != nil || self.ordinaryRequest;
+    self.status.text = ordinary ? @"已到达骑行目的地" : @"已到达自提门店";
+    self.guidance(@"已到达", ordinary ? @"目的地" : @"自提门店");
     [self saveTrackAfterEnding:NO];
 }
 
@@ -501,6 +569,7 @@ static NSString *distanceText(NSInteger meters) {
 
 - (void)fail:(NSString *)message {
     BOOL guiding = self.stage == KnightRideStarting || self.stage == KnightRideActive;
+    BOOL closeOrdinary = self.ordinaryRequest && self.voiceStartResult != nil;
     self.stage = KnightRideFailed;
     [self reportVoiceStart:NO detail:message];
     [self stopSDK];
@@ -512,7 +581,7 @@ static NSString *distanceText(NSInteger meters) {
     [self.startButton setTitle:@"重试算路" forState:UIControlStateNormal];
     self.startButton.enabled = YES;
     self.guidance(guiding ? @"导航结束" : @"算路未完成", @"请看手机");
-    [self saveTrackAfterEnding:NO];
+    [self saveTrackAfterEnding:closeOrdinary];
 }
 
 - (void)closeRide {

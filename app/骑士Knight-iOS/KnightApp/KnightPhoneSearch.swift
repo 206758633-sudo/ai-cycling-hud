@@ -2,10 +2,33 @@
 import UIKit
 import Vision
 
+private final class PickupInterruption: @unchecked Sendable {
+    private let lock = NSLock()
+    private var route: String?
+    private var checkoutLocked = false
+
+    var requestedRoute: String? { lock.withLock { route } }
+
+    func request(_ routeID: String) {
+        lock.withLock {
+            if !checkoutLocked, route == nil { route = routeID }
+        }
+    }
+
+    func beginCheckout() -> Bool {
+        lock.withLock {
+            guard route == nil else { return false }
+            checkoutLocked = true
+            return true
+        }
+    }
+}
+
 @MainActor
 final class KnightPhoneSearch {
     private let queue = OperationQueue()
     private var busy = false
+    private var pickupInterruption: PickupInterruption?
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
 
     init() {
@@ -70,6 +93,8 @@ final class KnightPhoneSearch {
         }
         let operation = BlockOperation()
         busy = true
+        let interruption = PickupInterruption()
+        pickupInterruption = interruption
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "KnightPickup") { [weak operation, weak self] in
             operation?.cancel()
             self?.endBackgroundTask()
@@ -77,13 +102,54 @@ final class KnightPhoneSearch {
         operation.addExecutionBlock { [weak operation, weak self] in
             guard let operation else { return }
             let result: KnightPickupResult
-            let plan = PhonePickupPlan(task: task, operation: operation)
+            let plan = PhonePickupPlan(task: task, operation: operation, interruption: interruption)
             do { result = .ready(try plan.run(), plan.navigation) }
-            catch { result = .stopped(error.localizedDescription, plan.navigation, plan.clarification, plan.cartAdded) }
+            catch {
+                if let routeID = interruption.requestedRoute {
+                    result = .paused(routeID, plan.navigation)
+                } else {
+                    result = .stopped(error.localizedDescription, plan.navigation, plan.clarification, plan.cartAdded)
+                }
+            }
             Task { @MainActor in
                 await report(result)
                 self?.endBackgroundTask()
                 self?.busy = false
+                self?.pickupInterruption = nil
+            }
+        }
+        queue.addOperation(operation)
+    }
+
+    func pausePickup(for routeID: String) {
+        pickupInterruption?.request(routeID)
+    }
+
+    var hasPickupExecution: Bool { pickupInterruption != nil }
+
+    func startRecommendation(category: String, destination: String,
+                             completion: @escaping @MainActor (Result<KnightStoreRecommendation, Error>) -> Void) {
+        guard !busy, UIApplication.shared.applicationState == .active else {
+            completion(.failure(PhoneSearchPlan.Stop(message: "骑士暂时无法打开美团")))
+            return
+        }
+        let operation = BlockOperation()
+        let task = KnightPickupTask(id: "recommendation", query: category, merchant: category, options: "",
+                                    quantity: 1, budgetCents: 0, pickupDestination: destination, expiresIn: 55,
+                                    expectedPickupStore: nil, voiceRequest: nil)
+        busy = true
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "KnightRestaurantLookup") { [weak operation, weak self] in
+            operation?.cancel()
+            self?.endBackgroundTask()
+        }
+        operation.addExecutionBlock { [weak operation, weak self] in
+            guard let operation else { return }
+            let plan = PhonePickupPlan(task: task, operation: operation, interruption: PickupInterruption())
+            let result = Result { try plan.recommendStore() }
+            Task { @MainActor in
+                self?.endBackgroundTask()
+                self?.busy = false
+                completion(result)
             }
         }
         queue.addOperation(operation)
@@ -333,9 +399,17 @@ struct KnightPickupQuote: Codable {
     let quantity: Int
 }
 
+struct KnightStoreRecommendation {
+    let store: String
+    let score: Double
+    let distance: Int
+    let dishes: [String]
+}
+
 enum KnightPickupResult {
     case ready(KnightPickupQuote, KnightPickupPlace?)
     case stopped(String, KnightPickupPlace?, String?, Bool)
+    case paused(String, KnightPickupPlace?)
 }
 
 private final class PhonePickupPlan {
@@ -347,6 +421,7 @@ private final class PhonePickupPlan {
     private let native = PKInProcess.shared()
     private let task: KnightPickupTask
     private let operation: Operation
+    private let interruption: PickupInterruption
     private let deadline: TimeInterval
     private(set) var navigation: KnightPickupPlace?
     private(set) var clarification: String?
@@ -360,9 +435,10 @@ private final class PhonePickupPlan {
         }
     }
 
-    init(task: KnightPickupTask, operation: Operation) {
+    init(task: KnightPickupTask, operation: Operation, interruption: PickupInterruption) {
         self.task = task
         self.operation = operation
+        self.interruption = interruption
         deadline = ProcessInfo.processInfo.systemUptime + Double(min(task.expiresIn, 65))
     }
 
@@ -378,6 +454,7 @@ private final class PhonePickupPlan {
     }
 
     private func checkActive() throws {
+        if interruption.requestedRoute != nil { throw fail("订单已暂停，优先执行导航") }
         guard !operation.isCancelled, ProcessInfo.processInfo.systemUptime < deadline else { throw fail("手机执行时间已到，请核对美团当前页面") }
         guard !native.screenLocked() else { throw fail("请先解锁 iPhone") }
     }
@@ -410,7 +487,7 @@ private final class PhonePickupPlan {
     }
 
     private func wait(timeoutMessage: String = "美团未显示预期页面，请核对当前页面", attempts: Int = 5,
-                      interval: TimeInterval = 0.28, openingApp: Bool = false,
+                      interval: TimeInterval = 0.28, retryUnreadablePage: Bool = false,
                       _ predicate: (PhoneControlTree) throws -> Bool) throws -> PhoneControlTree {
         var last: PhoneControlTree?
         for attempt in 0..<attempts {
@@ -420,7 +497,7 @@ private final class PhonePickupPlan {
             let page: PhoneControlTree
             do {
                 page = try read()
-            } catch let stop as Stop where openingApp && stop.message == fail("未读到美团页面").message {
+            } catch let stop as Stop where retryUnreadablePage && stop.message == fail("未读到美团页面").message {
                 continue
             }
             if try predicate(page) { return page }
@@ -474,7 +551,8 @@ private final class PhonePickupPlan {
     }
 
     @discardableResult
-    private func type(_ value: String, in field: PhoneControl, using page: PhoneControlTree? = nil) throws -> PhoneControlTree {
+    private func type(_ value: String, in field: PhoneControl, using page: PhoneControlTree? = nil,
+                      forceReentry: Bool = false) throws -> PhoneControlTree {
         let focused: PhoneControlTree
         if let page, page.focusedValue != nil, page.focusedFrame == field.frame {
             focused = page
@@ -483,12 +561,21 @@ private final class PhonePickupPlan {
             focused = try wait { $0.focusedValue != nil }
         }
         let current = focused.focusedValue ?? ""
-        if current == value { return focused }
+        if current == value && !forceReentry { return focused }
         try front()
         let placeholder = current == focused.placeholder || (field.label == current && (current.hasPrefix("请输入") || current.hasPrefix("搜索")))
         let existing = placeholder ? "" : current
         guard existing.count <= 100 else { throw fail("搜索框已有其他内容") }
-        let input = String(repeating: "\u{8}", count: existing.count) + value
+        let erase = String(repeating: "\u{8}", count: existing.count)
+        var input = erase + value
+        if forceReentry && current == value && !erase.isEmpty {
+            guard native.type(erase, timeout: 5).delivery == .sent else { throw fail("旧搜索词未清除") }
+            _ = try wait { page in
+                page.focusedValue == "" || (page.focusedValue != nil && page.focusedValue == page.placeholder)
+            }
+            try front()
+            input = value
+        }
         guard native.type(input, timeout: 5).delivery == .sent else { throw fail("输入结果待核对") }
         return try wait { $0.focusedValue == value || $0.controls.contains { $0.kind.hasSuffix("TextField") && $0.texts.contains(value) } }
     }
@@ -507,7 +594,7 @@ private final class PhonePickupPlan {
         has(page, "选择收货地址") || has(page, "搜索地址") || has(page, "搜索您的收货地址")
     }
 
-    private func openAddressSelection(_ page: PhoneControlTree) throws -> PhoneControlTree {
+    private func openAddressSelection(_ page: PhoneControlTree, allowDelayedTransition: Bool = false) throws -> PhoneControlTree {
         if isAddressSelection(page) { return page }
         guard let button = address(page), let name = capture("^地址[：:]\\s*(.+)$", in: button.label)?.first else {
             throw fail("未找到唯一的外卖地址入口")
@@ -516,15 +603,18 @@ private final class PhonePickupPlan {
         NSLog("[knight-pickup] address AX center %.1f,%.1f", button.frame.midX, button.frame.midY)
         try tap(button)
         do {
-            return try wait(timeoutMessage: noTransition, attempts: 4, isAddressSelection)
+            return try wait(timeoutMessage: noTransition, attempts: allowDelayedTransition ? 6 : 4,
+                            retryUnreadablePage: true, isAddressSelection)
         } catch let stop as Stop where stop.message == fail(noTransition).message {
             let current = try read()
             if isAddressSelection(current) { return current }
-            guard address(current)?.label == button.label,
-                  let point = try visibleAddressPoint(name) else { throw stop }
+            guard let currentAddress = address(current),
+                  let currentName = capture("^地址[：:]\\s*(.+)$", in: currentAddress.label)?.first,
+                  locationKey(currentName) == locationKey(name),
+                  let point = try visibleAddressPoint(currentName) else { throw stop }
             NSLog("[knight-pickup] recovered visible address header at %.1f,%.1f", point.x, point.y)
             try tapPoint(point)
-            return try wait(timeoutMessage: "美团仍未打开地址选择页", isAddressSelection)
+            return try wait(timeoutMessage: "美团仍未打开地址选择页", attempts: 7, retryUnreadablePage: true, isAddressSelection)
         }
     }
 
@@ -543,13 +633,41 @@ private final class PhonePickupPlan {
             .replacingOccurrences(of: "[\\s()（）·‑—-]", with: "", options: .regularExpression)
     }
 
-    private func destination(_ home: PhoneControlTree) throws -> (PhoneControlTree, String) {
-        let requested = task.pickupDestination.replacingOccurrences(of: "\\s*(?:附近|周边)$", with: "", options: .regularExpression)
+    private func pickupDestinationForSearch(_ value: String) -> String {
+        value.precomposedStringWithCompatibilityMapping
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\s*(?:附近|周边)$", with: "", options: .regularExpression)
+            .replacingOccurrences(
+                of: "地铁(?:站)?口[\\s,，、]*([A-Za-z])[\\s,，、]*(?:出)?口$",
+                with: "地铁站$1出口", options: .regularExpression)
+    }
+
+    private func addressSearchField(_ page: PhoneControlTree) -> PhoneControl? {
+        guard page.controls.contains(where: { $0.texts.contains { $0.contains("搜索地址") } }) else { return nil }
+        let bounds = native.readDisplayGeometry().bounds
+        func inAddressHeader(_ frame: CGRect) -> Bool {
+            (45...180).contains(frame.midY) && frame.width > 100 &&
+                bounds.contains(CGPoint(x: frame.midX, y: frame.midY))
+        }
+        func editable(_ control: PhoneControl) -> Bool {
+            (control.kind.hasSuffix("TextField") || control.kind.hasSuffix("SearchField")) && inAddressHeader(control.frame)
+        }
+        if let field = page.unique({ editable($0) && $0.texts.contains { $0.contains("搜索") || $0.contains("地址") } }) ?? page.unique(editable) { return field }
+        if let frame = page.focusedFrame, inAddressHeader(frame) {
+            return PhoneControl(kind: "FocusedTextField", label: page.placeholder ?? "", texts: [], frame: frame)
+        }
+        return nil
+    }
+
+    private func destination(_ home: PhoneControlTree, recommendation: Bool = false) throws -> (PhoneControlTree, String) {
+        let requested = pickupDestinationForSearch(task.pickupDestination)
         if locationMatches(home, requested) { return (home, requested) }
         phase = "打开地址选择"
-        var tree = try openAddressSelection(home)
+        var tree = try openAddressSelection(home, allowDelayedTransition: recommendation)
         var query = requested
-        if let searchEntry = find(tree, "搜索您的收货地址") {
+        // The address picker can expose a back button beside the search entry.
+        // Recommendations use the city beside the editable field on the next page.
+        if !recommendation, let searchEntry = find(tree, "搜索您的收货地址") {
             let cityChoice = tree.unique { control in
                 control.kind.hasSuffix("Button") && control.frame.midX < searchEntry.frame.minX &&
                     abs(control.frame.midY - searchEntry.frame.midY) < 15 &&
@@ -578,23 +696,39 @@ private final class PhonePickupPlan {
         }
         phase = "打开地址搜索"
         if !has(tree, "搜索地址") { try tap(find(tree, "搜索您的收货地址")) }
-        func addressField(_ page: PhoneControlTree) -> PhoneControl? {
-            guard page.controls.contains(where: { $0.texts.contains { $0.contains("搜索地址") } }) else { return nil }
-            func editable(_ control: PhoneControl) -> Bool {
-                (control.kind.hasSuffix("TextField") || control.kind.hasSuffix("SearchField")) && control.frame.midY < 180 && control.frame.width > 100
+        tree = try wait { self.addressSearchField($0) != nil }
+        guard var field = addressSearchField(tree) else { throw fail("地址输入框不唯一") }
+        if recommendation, let parts = capture("^([\\p{Han}]{2,8}?)市(.{2,})$", in: requested) {
+            query = parts[1]
+            let cityButton = tree.unique { control in
+                control.kind.hasSuffix("Button") && control.frame.midX < field.frame.minX &&
+                    abs(control.frame.midY - field.frame.midY) < 12 &&
+                    !["返回", "取消", "关闭", "选择城市", "切换城市"].contains(control.label) &&
+                    self.capture("^([\\p{Han}]{2,8}?)市?$", in: control.label) != nil
             }
-            if let field = page.unique({ editable($0) && $0.texts.contains { $0.contains("搜索") || $0.contains("地址") } }) ?? page.unique(editable) { return field }
-            if let frame = page.focusedFrame, frame.midY < 180, frame.width > 100 {
-                return PhoneControl(kind: "FocusedTextField", label: page.placeholder ?? "", texts: [], frame: frame)
+            let city: (name: String, point: CGPoint)?
+            if let cityButton, let name = capture("^([\\p{Han}]{2,8}?)市?$", in: cityButton.label)?.first {
+                city = (name, CGPoint(x: cityButton.frame.midX, y: cityButton.frame.midY))
+            } else {
+                city = try visibleAddressSearchCity()
             }
-            return nil
+            if let city, city.name != parts[0] {
+                phase = "选择目的地城市"
+                try tapPoint(city.point)
+                let cities = try wait { self.has($0, "热门城市") }
+                guard let match = find(cities, parts[0] + "市", parts[0]) else { throw fail("美团未显示指定城市") }
+                try tap(match)
+                tree = try wait { self.addressSearchField($0) != nil }
+                guard let updated = addressSearchField(tree) else { throw fail("美团未返回地址搜索页") }
+                field = updated
+            }
+            NSLog("[knight-recommendation] address search city %@ (previous %@)", parts[0], city?.name ?? "unavailable")
         }
-        tree = try wait { addressField($0) != nil }
-        guard let field = addressField(tree) else { throw fail("地址输入框不唯一") }
         if let district = capture("^[\\p{Han}]{2,8}(?:区|县)(.{2,})$", in: query)?.first { query = district }
-        if let station = capture("^(.+?地铁站?)[\\s()（）‑—-]*[A-Za-z](?:出)?口[)）]?$", in: query)?.first { query = station }
+        let exitQuery = capture("^(.+?地铁站?)[\\s()（）·‑—-]*([A-Za-z])(?:出)?口[)）]?$", in: query)
+        if let exitQuery { query = exitQuery[0] + "-" + exitQuery[1].uppercased() + "口" }
         phase = "输入自提目的地"
-        try type(query.isEmpty ? requested : query, in: field)
+        try type(query.isEmpty ? requested : query, in: field, using: tree, forceReentry: recommendation)
         func results(_ page: PhoneControlTree, _ name: String) -> [(PhoneControl, String)] {
             page.controls.compactMap { control in
                 guard (control.kind.hasSuffix("Button") || control.kind.hasSuffix("Cell") || control.kind.hasSuffix("Other")),
@@ -618,9 +752,25 @@ private final class PhonePickupPlan {
         let exact = qualified.filter { locationKey($0.1) == locationKey(requested) }
         let matches = exact.isEmpty ? qualified : exact
         guard let (match, name) = matches.first, Set(matches.map { $0.0.label }).count == 1 else { throw fail("地址结果不唯一") }
-        try tap(match)
+        if capture("地铁站?[\\s()（）·‑—-]*([A-Za-z])(?:出)?口[)）]?$", in: name) != nil {
+            // Some address result containers report coordinates spanning adjacent rows.
+            // Use the rendered exit label to identify the actual row before touching it.
+            let first = try visiblePickupExitPoint(name, below: field.frame.maxY)
+            guard let point = try visiblePickupExitPoint(name, below: field.frame.maxY),
+                  let first, abs(first.y - point.y) < 8 else {
+                throw fail("美团结果中的指定地铁出口尚未稳定显示")
+            }
+            NSLog("[knight-pickup] selecting visible exit %@ %.1f,%.1f (AX %.1f,%.1f)",
+                  name, point.x, point.y, match.frame.midX, match.frame.midY)
+            savePickupDiagnostic("knight-pickup-exit-result.jpg")
+            try tapPoint(point)
+        } else {
+            try tap(match)
+        }
         phase = "核对选中的目的地"
-        return (try wait { self.locationMatches($0, name) }, name)
+        tree = try wait { self.locationMatches($0, name) }
+        NSLog("[knight-pickup] verified selected location %@", name)
+        return (tree, name)
     }
 
     private func catalog(_ tree: PhoneControlTree) -> Bool { has(tree, "自取好价") && has(tree, "奶茶咖啡") && has(tree, "自取") }
@@ -634,7 +784,7 @@ private final class PhonePickupPlan {
         }
     }
 
-    private func searchMerchant(_ home: PhoneControlTree, place: String) throws -> PhoneControlTree {
+    private func submitNearbySearch(_ home: PhoneControlTree, place: String) throws {
         phase = "搜索附近指定门店"
         guard !task.merchant.isEmpty, locationMatches(home, place) else { throw fail("请核对搜索范围及品牌") }
         let entry = home.unique { $0.kind.hasSuffix("SearchField") && $0.frame.midY < 210 } ?? find(home, "搜索")
@@ -658,15 +808,23 @@ private final class PhonePickupPlan {
             try front()
             guard page.focusedValue == task.merchant, native.type("\n", timeout: 2).delivery == .sent else { throw fail("无法确认搜索已提交") }
         }
+    }
+
+    private func searchMerchant(_ home: PhoneControlTree, place: String) throws -> PhoneControlTree {
+        try submitNearbySearch(home, place: place)
         do {
             var checks = 0
-            return try wait(timeoutMessage: "美团未加载出带明确距离的店铺卡片", attempts: 14, interval: 0.48) {
+            return try wait(timeoutMessage: "未能核对附近的\(task.merchant)门店和距离", attempts: 14, interval: 0.48) {
                 guard $0.focusedValue == nil else { return false }
                 let names = $0.controls.filter { self.isMerchantName($0.label) }
                 let cards = self.listedMerchants($0)
                 if !cards.isEmpty && names.allSatisfy({ name in
                     cards.contains { self.locationKey($0.0.label) == self.locationKey(name.label) }
                 }) { return true }
+                if names.isEmpty && $0.controls.contains(where: { $0.label.contains("搜索结果较少") }) {
+                    if (try? self.visibleMerchantCards().isEmpty) == false { return true }
+                    throw self.fail("美团当前没有返回可核对的\(self.task.merchant)门店")
+                }
                 checks += 1
                 if checks == 3 || checks == 6 || checks == 9 || checks == 12 {
                     return (try? self.visibleMerchantCards().isEmpty) == false
@@ -693,8 +851,13 @@ private final class PhonePickupPlan {
         return cards.values.sorted { $0.1 < $1.1 }
     }
 
+    private func matchesMerchantBrand(_ label: String) -> Bool {
+        let brand = label.prefix { $0 != "(" && $0 != "（" }
+        return brand.contains(task.merchant) && (!brand.contains("代购") || task.merchant.contains("代购"))
+    }
+
     private func isMerchantName(_ label: String) -> Bool {
-        label.contains(task.merchant) && capture("^([^（(]+[（(][^）)]+店[）)])$", in: label) != nil
+        matchesMerchantBrand(label) && capture("^([^（(]+[（(][^）)]+店[）)])$", in: label) != nil
     }
 
     private func merchantDistance(_ label: String) -> Int? {
@@ -703,6 +866,107 @@ private final class PhonePickupPlan {
               let number = Double(value[0]), number.isFinite else { return nil }
         let meters = number * (["km", "公里"].contains(value[1]) ? 1000 : 1)
         return meters < 100000 ? Int(meters.rounded()) : nil
+    }
+
+    private func ratedRestaurantCards(_ screen: StorefrontImage) -> [KnightStoreRecommendation] {
+        let ratings: [(String, CGRect, Double)] = screen.text.compactMap { label, box in
+            guard (0.19...0.85).contains(box.midY), box.minX < 0.42,
+                  let match = capture("^[^0-9]{0,3}([1-5][.．][0-9])(?:分|\\s*月售|\\s|$)", in: label)?.first,
+                  let score = Double(match.replacingOccurrences(of: "．", with: ".")), score <= 5 else { return nil }
+            return (label, box, score)
+        }
+        return ratings.compactMap { _, rating, score in
+            let titles = screen.text.filter { label, box in
+                (0.013...0.044).contains(box.midY - rating.midY) && (0.11...0.38).contains(box.minX) &&
+                    label.count >= 4 && label.count <= 46 &&
+                    !label.contains("推荐") && !label.contains("代购") &&
+                    !label.contains("外卖专营") && capture("[\\p{Han}]+", in: label) != nil
+            }
+            guard let title = titles.min(by: { $0.1.midY < $1.1.midY })?.0 else { return nil }
+            let distances = Set(screen.text.compactMap { label, box -> Int? in
+                guard box.midX > 0.69, abs(box.midY - rating.midY) < 0.016 else { return nil }
+                return merchantDistance(label)
+            })
+            guard let distance = distances.first, distances.count == 1, distance > 0, distance <= 1500 else { return nil }
+            let nextRating = ratings.map { $0.1.midY }.filter { $0 < rating.midY }.max() ?? 0
+            let bottom = max(nextRating + 0.065, rating.midY - 0.26)
+            let items = screen.text.filter { _, box in
+                box.midY > bottom && box.midY < rating.midY - 0.068 && box.minX > 0.15
+            }.sorted { lhs, rhs in
+                if abs(lhs.1.midY - rhs.1.midY) < 0.018 { return lhs.1.minX < rhs.1.minX }
+                return lhs.1.midY > rhs.1.midY
+            }
+            var dishes: [String] = []
+            for (label, _) in items {
+                // Product preview labels may include a serving-size suffix.
+                let dish = String(label.prefix { $0 != "(" && $0 != "（" })
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard (3...16).contains(dish.count), !dishes.contains(dish),
+                      dish.range(of: "烤|串|生蚝|猪蹄|羊排|小龙虾|鸡翅|鱿鱼", options: .regularExpression) != nil,
+                      dish.range(of: "套餐|新品|特价|店|堂食|¥|￥|折扣|好评|热销|下单|神券|推荐|减", options: .regularExpression) == nil
+                else { continue }
+                dishes.append(dish)
+                if dishes.count == 3 { break }
+            }
+            return KnightStoreRecommendation(store: title, score: score, distance: distance, dishes: dishes)
+        }
+    }
+
+    func recommendStore() throws -> KnightStoreRecommendation {
+        guard native.prepare()["ok"] as? Bool == true else { throw fail("iPhone 本机美团读取未就绪") }
+        defer {
+            if !operation.isCancelled, let bundle = Bundle.main.bundleIdentifier,
+               native.frontApp()["bundleId"] as? String == appID { _ = native.app(bundle, action: "activate") }
+            _ = native.close()
+        }
+        if native.frontApp()["bundleId"] as? String != appID {
+            guard native.app(appID, action: "activate") == nil else { throw fail("无法打开美团") }
+            Thread.sleep(forTimeInterval: 0.35)
+        }
+        let home: PhoneControlTree
+        let place: String
+        do {
+            (home, place) = try destination(takeoutHome(), recommendation: true)
+        } catch {
+            savePickupDiagnostic("knight-recommendation-address.jpg")
+            throw error
+        }
+        try submitNearbySearch(home, place: place)
+        let result = try wait(attempts: 7, interval: 0.4) { page in
+            page.focusedValue == nil && page.controls.contains { $0.label.contains("点评高分") }
+        }
+        if let filter = result.controls.first(where: { $0.label.hasPrefix("点评高分") && (120...400).contains($0.frame.midY) }),
+           !filter.label.contains("已选中") {
+            try tap(filter)
+            Thread.sleep(forTimeInterval: 0.55)
+        }
+        phase = "核对美团门店评分和菜单"
+        var cards: [KnightStoreRecommendation] = []
+        for page in 0..<3 {
+            if let picture = try readStorefrontImage(region: CGRect(x: 0, y: 0, width: 1, height: 1), refreshViewport: true) {
+                cards += ratedRestaurantCards(picture)
+            }
+            if page < 2 {
+                try front()
+                let geometry = native.readDisplayGeometry()
+                let x = geometry.bounds.midX
+                let path = [PKTouchPoint.at(CGPoint(x: x, y: geometry.bounds.height * 0.77), offset: 0),
+                            PKTouchPoint.at(CGPoint(x: x, y: geometry.bounds.height * 0.43), offset: 0.28)]
+                guard native.touch([path], timeout: 1.5, geometry: geometry).delivery == .sent else { break }
+                Thread.sleep(forTimeInterval: 0.28)
+            }
+        }
+        guard let choice = cards.sorted(by: {
+            if $0.score != $1.score { return $0.score > $1.score }
+            if $0.distance != $1.distance { return $0.distance < $1.distance }
+            return $0.dishes.count > $1.dishes.count
+        }).first else {
+            savePickupDiagnostic("knight-recommendation-result.jpg")
+            throw fail("当前结果没有可核对的附近门店评分")
+        }
+        NSLog("[knight-recommendation] selected %@ %.1f %d m dishes %@", choice.store, choice.score,
+              choice.distance, choice.dishes.joined(separator: " / "))
+        return choice
     }
 
     private func merchantSupportsPickup(_ page: PhoneControlTree) -> Bool {
@@ -717,7 +981,9 @@ private final class PhonePickupPlan {
         node.label.range(of: "^自取\\s*[，,]?\\s*距您\\s*\\d+(?:\\.\\d+)?\\s*(?:km|m|公里|米)$", options: .regularExpression) != nil
     }
 
-    private func activateMerchantPickup(_ page: PhoneControlTree) throws -> PhoneControlTree? {
+    private func activateMerchantPickup(
+        _ page: PhoneControlTree, store: String, visualTab: VisiblePickupTab? = nil
+    ) throws -> PhoneControlTree? {
         func active(_ tree: PhoneControlTree) -> Bool {
             self.has(tree, "当前为到店自取") || self.has(tree, "当前为到店自提") ||
                 tree.controls.contains {
@@ -726,10 +992,33 @@ private final class PhonePickupPlan {
                 }
         }
         if active(page) { return page }
-        let tab = page.unique { $0.label.range(of: "^(?:到店自取|到店自提|自取).*未选中$", options: .regularExpression) != nil }
-        guard let choice = tab ?? find(page, "到店自取", "到店自提", "自取") ?? page.unique(isPickupDistanceTab) else { return nil }
-        try tap(choice)
-        return try wait(timeoutMessage: "美团未确认已切换成自提", attempts: 8, interval: 0.4, active)
+        let storefront = visualTab ?? (try? visiblePickupTab(in: store))
+        if let future = storefront?.futurePickup { throw fail("\(store)自取需\(future)后取餐") }
+        if storefront?.selected == true { return page }
+        if let storefront {
+            try tapPoint(storefront.point)
+        } else {
+            let tab = page.unique { $0.label.range(of: "^(?:到店自取|到店自提|自取).*未选中$", options: .regularExpression) != nil }
+            guard let choice = tab ?? find(page, "到店自取", "到店自提", "自取") ?? page.unique(isPickupDistanceTab) else { return nil }
+            try tap(choice)
+        }
+        var checks = 0
+        var checkedTab: VisiblePickupTab?
+        do {
+            let confirmed = try wait(timeoutMessage: "美团未确认已切换成自提", attempts: 8, interval: 0.4, retryUnreadablePage: true) { result in
+                if active(result) { return true }
+                checks += 1
+                if checks == 2 || checks == 4 || checks == 6 {
+                    checkedTab = try? self.visiblePickupTab(in: store)
+                }
+                return checkedTab?.selected == true
+            }
+            if let future = checkedTab?.futurePickup { throw fail("\(store)自取需\(future)后取餐") }
+            return confirmed
+        } catch {
+            savePickupDiagnostic()
+            throw error
+        }
     }
 
     private func isRestaurant(_ page: PhoneControlTree) -> Bool {
@@ -749,12 +1038,14 @@ private final class PhonePickupPlan {
         let text: [(String, CGRect)]
     }
 
-    private func readStorefrontImage(region: CGRect = CGRect(x: 0.02, y: 0.32, width: 0.96, height: 0.39)) throws -> StorefrontImage? {
+    private func readStorefrontImage(
+        region: CGRect = CGRect(x: 0.02, y: 0.32, width: 0.96, height: 0.39), refreshViewport: Bool = false
+    ) throws -> StorefrontImage? {
         try front()
         let bounds = native.readDisplayGeometry().bounds
         guard (350...450).contains(bounds.width), (740...950).contains(bounds.height) else { return nil }
         var code: NSString?
-        guard let bytes = native.screenshot(&code, refreshViewport: false),
+        guard let bytes = native.screenshot(&code, refreshViewport: refreshViewport),
               let picture = UIImage(data: bytes), picture.imageOrientation == .up,
               let image = picture.cgImage else { return nil }
         let request = VNRecognizeTextRequest()
@@ -774,12 +1065,14 @@ private final class PhonePickupPlan {
 
     private func visibleAddressPoint(_ name: String) throws -> CGPoint? {
         let header = CGRect(x: 0.02, y: 0.84, width: 0.66, height: 0.11)
-        guard let screen = try readStorefrontImage(region: header) else { return nil }
+        guard let screen = try readStorefrontImage(region: header, refreshViewport: true) else { return nil }
         let expected = locationKey(name)
         guard expected.count >= 3 else { return nil }
         let addresses = screen.text.filter { text, box in
             let line = locationKey(text).replacingOccurrences(of: "[<>‹›〈〉◎⊙⌖📍]", with: "", options: .regularExpression)
-            return (0.87...0.95).contains(box.midY) && (line == expected || line == "外卖" + expected)
+            let addressText = line.hasPrefix("外卖") ? String(line.dropFirst(2)) : line
+            return (0.89...0.95).contains(box.midY) && addressText.count >= 3 &&
+                (addressText == expected || expected.hasSuffix(addressText))
         }
         guard addresses.count == 1, let label = addresses.first,
               label.0.contains("外卖") || screen.text.contains(where: {
@@ -788,6 +1081,37 @@ private final class PhonePickupPlan {
         let x = label.0.contains("外卖") ? label.1.midX + label.1.width * 0.15 : label.1.midX
         return CGPoint(x: screen.bounds.minX + screen.bounds.width * x,
                        y: screen.bounds.minY + screen.bounds.height * (1 - label.1.midY))
+    }
+
+    private func visibleAddressSearchCity() throws -> (name: String, point: CGPoint)? {
+        guard let screen = try readStorefrontImage(region: CGRect(x: 0, y: 0, width: 1, height: 1), refreshViewport: true),
+              let title = screen.text.first(where: {
+                  $0.0 == "搜索地址" && (0.39...0.61).contains($0.1.midX) && (0.88...0.95).contains($0.1.midY)
+              })?.1 else { return nil }
+        let labels = screen.text.compactMap { text, box -> (String, CGRect)? in
+            let label = text.trimmingCharacters(in: CharacterSet(charactersIn: "›〉∨⌄▼﹀>～~ ").union(.whitespaces))
+            guard (0.035...0.19).contains(box.midX), (0.035...0.080).contains(title.midY - box.midY),
+                  let city = capture("^([\\p{Han}]{2,8}?)市?$", in: label)?.first else { return nil }
+            return (city, box)
+        }
+        guard labels.count == 1, let (city, box) = labels.first else { return nil }
+        return (city, CGPoint(x: screen.bounds.minX + screen.bounds.width * box.midX,
+                              y: screen.bounds.minY + screen.bounds.height * (1 - box.midY)))
+    }
+
+    private func visiblePickupExitPoint(_ name: String, below searchField: CGFloat) throws -> CGPoint? {
+        let results = CGRect(x: 0.02, y: 0.27, width: 0.96, height: 0.60)
+        guard let screen = try readStorefrontImage(region: results, refreshViewport: true) else { return nil }
+        let expected = locationKey(name)
+        let matchingLabels = screen.text.filter { label, box in
+            let title = label.trimmingCharacters(in: CharacterSet(charactersIn: "◎⊙◉○●•⌖📍 ").union(.whitespaces))
+            // The typed query can repeat the exit above the list. Only choose a result row.
+            let y = screen.bounds.minY + screen.bounds.height * (1 - box.midY)
+            return y > searchField + 18 && locationKey(title) == expected
+        }
+        guard matchingLabels.count == 1, let box = matchingLabels.first?.1 else { return nil }
+        return CGPoint(x: screen.bounds.minX + screen.bounds.width * box.midX,
+                       y: screen.bounds.minY + screen.bounds.height * (1 - box.midY))
     }
 
     private func visibleMerchantCards() throws -> [(PhoneControl, Int)] {
@@ -810,22 +1134,37 @@ private final class PhonePickupPlan {
     }
 
     private func openStoreSearch(_ shop: PhoneControlTree, store: String) throws -> PhoneControlTree {
-        if let control = find(shop, "搜索") {
-            try tap(control)
-        } else {
-            let toolbar = CGRect(x: 0.34, y: 0.88, width: 0.58, height: 0.075)
-            guard try visiblePickupTab(in: store)?.selected == true,
-                  let screen = try readStorefrontImage(region: toolbar),
-                  let booking = screen.text.first(where: { $0.0 == "预订" && (0.63...0.74).contains($0.1.midX) }),
-                  screen.text.contains(where: {
-                      $0.0 == "拼单" && $0.1.midX > booking.1.midX && abs($0.1.midY - booking.1.midY) < 0.013
-                  }) else { throw fail("未找到可核对的店内搜索入口") }
-            // This merchant toolbar puts Search two positions to the left of Booking.
-            let point = CGPoint(x: screen.bounds.minX + screen.bounds.width * (booking.1.midX - 0.22),
-                                y: screen.bounds.minY + screen.bounds.height * (1 - booking.1.midY))
-            try tapPoint(point)
+        do {
+            if let control = find(shop, "搜索", "店内搜索", "搜索商品") {
+                try tap(control)
+            } else {
+                let toolbar = CGRect(x: 0.34, y: 0.88, width: 0.62, height: 0.075)
+                guard try visiblePickupTab(in: store)?.selected == true,
+                      let screen = try readStorefrontImage(region: toolbar, refreshViewport: true),
+                      let point = visibleStoreSearchPoint(screen) else { throw fail("未找到可核对的店内搜索入口") }
+                try tapPoint(point)
+            }
+            return try wait(timeoutMessage: "美团未显示店内商品搜索框", retryUnreadablePage: true) {
+                self.has($0, "请输入商品名")
+            }
+        } catch {
+            savePickupDiagnostic("knight-pickup-store-search.jpg")
+            throw error
         }
-        return try wait(timeoutMessage: "美团未显示店内商品搜索框") { self.has($0, "请输入商品名") }
+    }
+
+    private func visibleStoreSearchPoint(_ screen: StorefrontImage) -> CGPoint? {
+        let teamButtons = screen.text.filter { $0.0 == "拼单" }
+        let booking = screen.text.first {
+            guard $0.0 == "预订", (0.63...0.74).contains($0.1.midX) else { return false }
+            let box = $0.1
+            return teamButtons.contains { $0.1.midX > box.midX && abs($0.1.midY - box.midY) < 0.013 }
+        }
+        let compactTeamButtons = teamButtons.filter { (0.78...0.86).contains($0.1.midX) && (0.90...0.94).contains($0.1.midY) }
+        // Search sits two toolbar slots left of Booking, or two left of Group Order when Booking is absent.
+        guard let anchor = booking?.1 ?? (compactTeamButtons.count == 1 ? compactTeamButtons.first?.1 : nil) else { return nil }
+        return CGPoint(x: screen.bounds.minX + screen.bounds.width * (anchor.midX - 0.22),
+                       y: screen.bounds.minY + screen.bounds.height * (1 - anchor.midY))
     }
 
     private func visibleStoreDismissPoint() throws -> CGPoint? {
@@ -875,7 +1214,7 @@ private final class PhonePickupPlan {
     }
 
     private func visiblePickupTab(in store: String) throws -> VisiblePickupTab? {
-        guard let screen = try readStorefrontImage() else { return nil }
+        guard let screen = try readStorefrontImage(refreshViewport: true) else { return nil }
         func normalized(_ text: String) -> String {
             text.precomposedStringWithCompatibilityMapping.replacingOccurrences(of: "[\\s()（）]", with: "", options: .regularExpression)
         }
@@ -890,8 +1229,15 @@ private final class PhonePickupPlan {
                   normalized($0.0).contains(normalized(store)) && $0.1.midY > tab.1.midY
               }) else { return nil }
         let y = tab.1.midY
-        let left = [0.12, 0.18, 0.36].filter { yellowTabBackground(screen.image, x: $0, y: y) }.count >= 2
-        let right = [0.55, 0.81, 0.88].filter { yellowTabBackground(screen.image, x: $0, y: y) }.count >= 2
+        func yellowTab(at positions: [CGFloat]) -> Bool {
+            positions.filter { x in
+                [-0.004, 0.0, 0.004].filter { offset in
+                    yellowTabBackground(screen.image, x: x, y: y + offset)
+                }.count >= 2
+            }.count >= 2
+        }
+        let left = yellowTab(at: [0.12, 0.18, 0.36])
+        let right = yellowTab(at: [0.55, 0.81, 0.88])
         guard left != right else { return nil }
         let availability = right ? screen.text.compactMap { line in
             line.1.midY > y && abs(line.1.midY - y) < 0.09
@@ -959,7 +1305,7 @@ private final class PhonePickupPlan {
             var observedPages = 0
             var visualTab: VisiblePickupTab?
             do {
-                page = try wait(timeoutMessage: "\(name.label)门店详情未加载完成", attempts: 18, interval: 0.45) { result in
+                page = try wait(timeoutMessage: "\(name.label)门店详情未加载完成", attempts: 18, interval: 0.45, retryUnreadablePage: true) { result in
                     observedPages += 1
                     if self.isRestaurant(result) && (self.merchantSupportsPickup(result) ||
                         result.controls.contains { $0.label.hasPrefix("点菜") && (45...700).contains($0.frame.midY) }) { return true }
@@ -972,30 +1318,10 @@ private final class PhonePickupPlan {
                 savePickupDiagnostic()
                 throw error
             }
-            if let tab = visualTab {
-                NSLog("[knight-pickup] verified pickup tabs from visible storefront %@", name.label)
-                if let future = tab.futurePickup { throw fail("\(name.label)自取需\(future)后取餐") }
-                if tab.selected { return (page, name.label) }
-                try tapPoint(tab.point)
-                var checks = 0
-                var selectedTab: VisiblePickupTab?
-                do {
-                    page = try wait(timeoutMessage: "美团未确认已切换成自提", attempts: 7, interval: 0.35) { result in
-                        if self.has(result, "当前为到店自取") || self.has(result, "当前为到店自提") { return true }
-                        checks += 1
-                        if checks == 2 || checks == 4 || checks == 6 {
-                            selectedTab = try? self.visiblePickupTab(in: name.label)
-                        }
-                        return selectedTab?.selected == true
-                    }
-                } catch {
-                    savePickupDiagnostic()
-                    throw error
-                }
-                if let future = selectedTab?.futurePickup { throw fail("\(name.label)自取需\(future)后取餐") }
-                return (page, name.label)
+            if visualTab != nil || merchantSupportsPickup(page),
+               let pickup = try activateMerchantPickup(page, store: name.label, visualTab: visualTab) {
+                return (pickup, name.label)
             }
-            if merchantSupportsPickup(page), let pickup = try activateMerchantPickup(page) { return (pickup, name.label) }
             let details = page.unique { $0.label.hasPrefix("商家") && $0.label.contains("未选中") }
             if let details {
                 try tap(details)
@@ -1005,7 +1331,7 @@ private final class PhonePickupPlan {
                 if merchantSupportsPickup(page) {
                     try tap(page.unique { $0.label.hasPrefix("点菜") && $0.label.contains("未选中") })
                     page = try wait { result in result.controls.contains { $0.label.hasPrefix("点菜") && $0.label.contains("已选中") } }
-                    if let pickup = try activateMerchantPickup(page) { return (pickup, name.label) }
+                    if let pickup = try activateMerchantPickup(page, store: name.label) { return (pickup, name.label) }
                 }
             }
             let hints = page.controls.filter { $0.label.count <= 60 && $0.label.range(of: "自取|自提|预订|休息|营业|配送|暂停|堂食|商家", options: .regularExpression) != nil }
@@ -1050,7 +1376,7 @@ private final class PhonePickupPlan {
             return self.catalog(page) && self.locationMatches(page, place) && distances.count >= 2 && distances == distances.sorted()
         }
         let rows = stores(tree).filter { _, label, _ in
-            if !task.merchant.isEmpty { return label.contains(task.merchant) }
+            if !task.merchant.isEmpty { return matchesMerchantBrand(label) }
             return label.range(of: "咖啡|coffee|星巴克|瑞幸|库迪|挪瓦|幸运咖|Manner|M Stand", options: [.caseInsensitive, .regularExpression]) != nil
         }
         guard let closest = rows.first, rows.dropFirst().first?.0 != closest.0 else { throw fail("最近咖啡门店无法唯一确认") }
@@ -1234,7 +1560,7 @@ private final class PhonePickupPlan {
     }
 
     private func takeoutHome() throws -> PhoneControlTree {
-        var page = try wait(attempts: 12, interval: 0.35, openingApp: true) { _ in true }
+        var page = try wait(attempts: 12, interval: 0.35, retryUnreadablePage: true) { _ in true }
         var restartedRestaurant = false
         var storeOverlaysChecked = 0
         for _ in 0..<7 {
@@ -1259,7 +1585,7 @@ private final class PhonePickupPlan {
                 restartedRestaurant = true
                 NSLog("[knight-pickup] reopening Meituan from a leftover restaurant page")
                 guard native.app(appID, action: "launch") == nil else { throw fail("无法从上次停留的门店页返回外卖入口") }
-                page = try wait(attempts: 12, interval: 0.3, openingApp: true) {
+                page = try wait(attempts: 12, interval: 0.3, retryUnreadablePage: true) {
                     !self.isRestaurant($0) && (self.address($0) != nil || self.find($0, "外卖") != nil)
                 }
                 continue
@@ -1323,7 +1649,8 @@ private final class PhonePickupPlan {
         guard task.quantity == 1 else { throw fail("本轮调试支持一杯，数量请在美团核对") }
         let permissions = native.prepare()
         defer {
-            if (task.voiceRequest == true || navigation?.mapURL != nil), !operation.isCancelled, !native.screenLocked(),
+            if (task.voiceRequest == true || navigation?.mapURL != nil || interruption.requestedRoute != nil),
+               !operation.isCancelled, !native.screenLocked(),
                let bundle = Bundle.main.bundleIdentifier, native.frontApp()["bundleId"] as? String == appID {
                 if let error = native.app(bundle, action: "activate") {
                     NSLog("[knight-pickup] could not return to Knight after Meituan: %@", error)
@@ -1452,6 +1779,7 @@ private final class PhonePickupPlan {
                   }
               }) else { throw fail("美团已有购物车或规格无法核对") }
         phase = "核对自提结算"
+        guard interruption.beginCheckout() else { throw fail("订单已暂停，优先执行导航") }
         if let visualCart {
             try tapPoint(visualCart)
         } else {

@@ -16,6 +16,7 @@
 #include <freertos/task.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -65,7 +66,14 @@ constexpr uint8_t kReceiptServiceUuid[] = {
 std::atomic<bool> receipt_connected{false};
 esp_gatt_if_t receipt_interface = ESP_GATT_IF_NONE;
 uint16_t receipt_characteristic = 0;
-uint16_t receipt_connection = 0;
+uint16_t relay_characteristic = 0;
+uint16_t relay_subscription = 0;
+std::atomic<uint16_t> receipt_connection{0};
+std::atomic<uint16_t> receipt_mtu{23};
+std::atomic<bool> relay_subscribed{false};
+std::atomic<int> relay_confirmation{0};
+bool relay_cache_refreshed = false;
+std::mutex relay_mutex;
 uint16_t next_frame = 0;
 std::vector<uint8_t> receipt_buffer;
 
@@ -75,6 +83,13 @@ esp_gatt_status_t AcceptReceiptFrame(const esp_ble_gatts_cb_param_t::gatts_write
     }
     if (write.len == 2 && write.value[0] == 0x80 && write.value[1] == 0) {
         receipt_connected.store(true);
+        ESP_LOGI(kTag, "Knight voice feedback channel connected");
+        if (!relay_subscribed && !relay_cache_refreshed) {
+            auto peer = write.bda;
+            esp_bd_addr_t address;
+            std::copy_n(peer, sizeof(address), address);
+            relay_cache_refreshed = esp_ble_gatts_send_service_change_indication(receipt_interface, address) == ESP_OK;
+        }
         return ESP_GATT_OK;
     }
     if (!receipt_connected.load() || write.len < 3) return ESP_GATT_INVALID_PDU;
@@ -109,7 +124,7 @@ bool HandleReceiptGatt(esp_gatts_cb_event_t event, esp_gatt_if_t interface,
         service.is_primary = true;
         service.id.uuid.len = ESP_UUID_LEN_128;
         std::copy_n(kReceiptServiceUuid, ESP_UUID_LEN_128, service.id.uuid.uuid.uuid128);
-        esp_ble_gatts_create_service(interface, &service, 4);
+        esp_ble_gatts_create_service(interface, &service, 6);
         return true;
     }
     if (receipt_interface == ESP_GATT_IF_NONE || interface != receipt_interface) return false;
@@ -127,27 +142,74 @@ bool HandleReceiptGatt(esp_gatts_cb_event_t event, esp_gatt_if_t interface,
                                ESP_GATT_PERM_WRITE_ENCRYPTED, ESP_GATT_CHAR_PROP_BIT_WRITE, &value, &control);
         break;
     }
-    case ESP_GATTS_ADD_CHAR_EVT:
+    case ESP_GATTS_ADD_CHAR_EVT: {
         if (data->add_char.status != ESP_GATT_OK) break;
-        receipt_characteristic = data->add_char.attr_handle;
-        esp_ble_gatts_start_service(data->add_char.service_handle);
+        auto uuid = data->add_char.char_uuid;
+        const auto service = data->add_char.service_handle;
+        if (uuid.uuid.uuid128[12] == 0x11) {
+            receipt_characteristic = data->add_char.attr_handle;
+            uuid.uuid.uuid128[12] = 0x12;
+            esp_ble_gatts_add_char(service, &uuid, ESP_GATT_PERM_READ_ENCRYPTED, ESP_GATT_CHAR_PROP_BIT_INDICATE,
+                                   nullptr, nullptr);
+        } else {
+            relay_characteristic = data->add_char.attr_handle;
+            esp_bt_uuid_t descriptor{};
+            descriptor.len = ESP_UUID_LEN_16;
+            descriptor.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+            esp_attr_control_t control{ESP_GATT_RSP_BY_APP};
+            esp_ble_gatts_add_char_descr(service, &descriptor, ESP_GATT_PERM_WRITE_ENCRYPTED, nullptr, &control);
+        }
+        break;
+    }
+    case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        if (data->add_char_descr.status == ESP_GATT_OK) {
+            relay_subscription = data->add_char_descr.attr_handle;
+            esp_ble_gatts_start_service(data->add_char_descr.service_handle);
+        }
+        break;
+    case ESP_GATTS_START_EVT:
+        ESP_LOGI(kTag, "Knight voice feedback service start status=%u relay=0x%04x", data->start.status, relay_characteristic);
+        break;
+    case ESP_GATTS_SEND_SERVICE_CHANGE_EVT:
+        ESP_LOGI(kTag, "Knight voice relay service refresh status=%u", data->service_change.status);
         break;
     case ESP_GATTS_CONNECT_EVT:
         receipt_connection = data->connect.conn_id;
+        receipt_mtu = 23;
         receipt_connected.store(false);
+        relay_subscribed = false;
+        relay_cache_refreshed = false;
         receipt_buffer.clear();
         next_frame = 0;
         break;
     case ESP_GATTS_DISCONNECT_EVT:
         receipt_connected.store(false);
+        relay_subscribed = false;
         receipt_buffer.clear();
         next_frame = 0;
         break;
-    case ESP_GATTS_WRITE_EVT:
-        if (!data->write.need_rsp) break;
-        esp_ble_gatts_send_response(interface, data->write.conn_id, data->write.trans_id,
-            data->write.handle == receipt_characteristic ? AcceptReceiptFrame(data->write) : ESP_GATT_INVALID_HANDLE, nullptr);
+    case ESP_GATTS_MTU_EVT:
+        if (data->mtu.conn_id == receipt_connection) receipt_mtu = data->mtu.mtu;
         break;
+    case ESP_GATTS_CONF_EVT:
+        if (data->conf.handle == relay_characteristic && data->conf.conn_id == receipt_connection) {
+            relay_confirmation = data->conf.status == ESP_GATT_OK ? 1 : -1;
+        }
+        break;
+    case ESP_GATTS_WRITE_EVT: {
+        if (!data->write.need_rsp) break;
+        const auto& write = data->write;
+        auto status = ESP_GATT_INVALID_HANDLE;
+        if (write.handle == receipt_characteristic) status = AcceptReceiptFrame(write);
+        if (write.handle == relay_subscription && write.conn_id == receipt_connection && !write.is_prep &&
+            write.offset == 0 && write.len == 2 && write.value[1] == 0 && (write.value[0] == 2 || write.value[0] == 0)) {
+            relay_subscribed = write.value[0] == 2;
+            if (relay_subscribed) ESP_LOGI(kTag, "Knight voice relay subscribed");
+            status = ESP_GATT_OK;
+        }
+        esp_ble_gatts_send_response(interface, write.conn_id, write.trans_id, status, nullptr);
+        break;
+    }
     default:
         break;
     }
@@ -231,7 +293,8 @@ void GapEvent(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
 void GattEvent(esp_gatts_cb_event_t event, esp_gatt_if_t interface,
                esp_ble_gatts_cb_param_t* data) {
 #ifdef KNIGHT_ORDERS_CONFIGURED
-    if (interface == ESP_GATT_IF_NONE && (event == ESP_GATTS_CONNECT_EVT || event == ESP_GATTS_DISCONNECT_EVT)) {
+    if (interface == ESP_GATT_IF_NONE && (event == ESP_GATTS_CONNECT_EVT || event == ESP_GATTS_DISCONNECT_EVT ||
+                                          event == ESP_GATTS_MTU_EVT || event == ESP_GATTS_CONF_EVT)) {
         HandleReceiptGatt(event, receipt_interface, data);
     } else if (HandleReceiptGatt(event, interface, data)) {
         return;
@@ -403,6 +466,37 @@ void SendPointerAction(int dx, int dy, int wheel, bool click) {
 bool KnightPickupBleConnected() {
 #ifdef KNIGHT_ORDERS_CONFIGURED
     return receipt_connected.load();
+#else
+    return false;
+#endif
+}
+
+bool SendKnightVoiceRelay(const uint8_t* packet, size_t size) {
+#ifdef KNIGHT_ORDERS_CONFIGURED
+    std::unique_lock lock(relay_mutex, std::try_to_lock);
+    if (!lock.owns_lock() || !receipt_connected || !relay_subscribed || size < 71 || size > 1200) return false;
+    const auto connection = receipt_connection.load();
+    const auto generation = connection_generation.load();
+    const auto expiry = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
+    const auto capacity = std::min<size_t>(178, std::max<int>(18, receipt_mtu.load() - 5));
+    std::array<uint8_t, 180> frame;
+    for (size_t offset = 0, sequence = 0; offset < size; ++sequence) {
+        if (!receipt_connected || !relay_subscribed || generation != connection_generation) return false;
+        const auto length = std::min(capacity, size - offset);
+        frame[0] = (offset == 0 ? 1 : 0) | (offset + length == size ? 2 : 0);
+        frame[1] = static_cast<uint8_t>(sequence);
+        std::copy_n(packet + offset, length, frame.data() + 2);
+        relay_confirmation = 0;
+        if (esp_ble_gatts_send_indicate(receipt_interface, connection, relay_characteristic,
+                                       length + 2, frame.data(), true) != ESP_OK) return false;
+        while (!relay_confirmation && receipt_connected && generation == connection_generation &&
+               static_cast<int32_t>(expiry - xTaskGetTickCount()) > 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (relay_confirmation != 1) return false;
+        offset += length;
+    }
+    return true;
 #else
     return false;
 #endif

@@ -5,16 +5,116 @@ import json
 from pathlib import Path
 import tempfile
 import time
+from threading import Event
 import unittest
 from unittest.mock import patch
 
 import knight_delivery as delivery
-from knight_orders import database, initialize
+from knight_orders import (APIError, claim_recommendation, database, enqueue_cycling_route,
+                           finish_recommendation, initialize, relay_voice_request)
 
 
 PLAN = dict(query='热美式', merchant='示例咖啡', options='不加糖', quantity=1, budget_cents=2000)
 DESTINATION = '深圳海上世界'
 PICKUP_PLAN = dict(PLAN, merchant='', pickup_destination=DESTINATION)
+
+
+class VoiceRequestRelayTest(unittest.TestCase):
+    device_key = b'irreplaceable-test-key'
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        path = Path(self.directory.name) / 'orders.sqlite3'
+        initialize(path)
+        self.db = database(path)
+        self.addCleanup(self.db.close)
+        self.wakeup = Event()
+
+    def packet(self, prefix, body, lifetime=20):
+        expiry = int(time.time()) + lifetime
+        packet = prefix + body['request_id'].encode('ascii') + expiry.to_bytes(4, 'big')
+        packet += json.dumps(body, ensure_ascii=False).encode('utf-8')
+        signed = packet + hmac.digest(self.device_key, packet, 'sha256')
+        return {'packet': base64.b64encode(signed).decode('ascii')}
+
+    def relay(self, packet):
+        status, result = relay_voice_request(self.db, packet, self.device_key, self.wakeup)
+        self.assertEqual(status, 200)
+        response = base64.b64decode(result['packet'])
+        self.assertEqual(response[:2], b'A1')
+        self.assertEqual(hmac.digest(self.device_key, response[:-32], 'sha256'), response[-32:])
+        return int(response[38:41]), response[41:-32].decode('ascii')
+
+    def test_pickup_is_claimed_once_across_bluetooth_and_wifi(self):
+        body = dict(PICKUP_PLAN, request_id='a' * 32)
+        status, task = self.relay(self.packet(b'P1', body))
+        self.assertEqual(status, 201)
+        self.assertTrue(self.wakeup.is_set())
+        self.assertEqual(delivery.enqueue(self.db, 'device', body)[1]['id'], task)
+        self.assertEqual(self.relay(self.packet(b'P1', body)), (200, task))
+        _, claimed = delivery.claim_phone_task(self.db, {'lease': 'voice-relay-phone-lease'})
+        self.assertEqual(claimed['id'], task)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM delivery_tasks').fetchone()[0], 1)
+
+    def test_navigation_replays_same_task(self):
+        body = {'request_id': 'b' * 32, 'city': '广州', 'destination': '黄村地铁口Ｂ出口'}
+        status, route = self.relay(self.packet(b'R1', body))
+        self.assertEqual(status, 201)
+        resolved = enqueue_cycling_route(self.db, dict(body, destination='黄村地铁站B口'))[1]
+        self.assertEqual(resolved['id'], route)
+        self.assertEqual(resolved['destination'], '黄村地铁站B口')
+        self.assertEqual(self.relay(self.packet(b'R1', body)), (200, route))
+
+    def test_tampered_and_expired_packets_do_not_queue(self):
+        body = dict(PICKUP_PLAN, request_id='c' * 32)
+        valid = self.packet(b'P1', body)
+        altered = bytearray(base64.b64decode(valid['packet']))
+        altered[38] ^= 1
+        for packet in (self.packet(b'P1', body, -1),
+                       {'packet': base64.b64encode(altered).decode('ascii')},
+                       self.packet(b'X1', body)):
+            with self.assertRaisesRegex(APIError, 'invalid_voice_relay'):
+                self.relay(packet)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM delivery_tasks').fetchone()[0], 0)
+
+    def test_pickup_navigation_relay_requires_verified_checkout(self):
+        _, order = delivery.enqueue(self.db, 'device', dict(PICKUP_PLAN, request_id='d' * 32))
+        task_id = order['id']
+        body = {'request_id': 'e' * 32, 'task_id': task_id}
+        self.assertEqual(self.relay(self.packet(b'V1', body)), (409, ''))
+        lease = 'pickup-relay-test-lease'
+        delivery.claim_phone_task(self.db, {'lease': lease})
+        place = dict(store='示例咖啡（测试店）', city='深圳市')
+        quote = dict(store=place['store'], pickup_address='深圳市南山区示例路1号',
+                     item='热美式（不加糖）', quantity=1, total_cents=830)
+        delivery.finish_phone_task(self.db, task_id, dict(state='pickup_checkout', lease=lease,
+                                                         navigation=place, quote=quote, cart_added=True))
+        self.assertEqual(self.relay(self.packet(b'V1', body)), (201, task_id))
+        self.assertEqual(self.relay(self.packet(b'V1', body)), (200, task_id))
+        _, ride = delivery.claim_pickup_ride(self.db, {'lease': 'pickup-relay-navi-lease'})
+        self.assertEqual(ride['place'], {**place, 'address': quote['pickup_address']})
+
+    def test_recommendation_is_read_only_and_requires_display_before_navigation(self):
+        search = dict(request_id='a' * 32, category='烧烤', city='广州市', district='天河区', destination='黄村地铁站B口')
+        status, job_id = self.relay(self.packet(b'Q1', search))
+        self.assertEqual(status, 201)
+        self.assertEqual(self.relay(self.packet(b'Q1', search)), (200, job_id))
+        ride = dict(request_id='b' * 32, task_id=job_id)
+        self.assertEqual(self.relay(self.packet(b'L1', ride)), (409, ''))
+        lease = 'read-only-store-recommendation'
+        self.assertEqual(claim_recommendation(self.db, {'lease': lease})[1]['id'], job_id)
+        self.assertEqual(claim_recommendation(self.db, {'lease': 'another-phone-own-lease'}), (204, None))
+        receipt = dict(id=job_id, lease=lease, store='探唐烧烤（小龙虾·海鲜·东圃店）',
+                       dishes=['东北油边串', '香辣烤猪蹄', '酱香烤鲜鱿鱼须'], note='美团 4.7 分', shown=True)
+        blob = base64.b64decode(finish_recommendation(self.db, receipt, self.device_key)[1]['packet'])
+        self.assertIn('酱香烤鲜鱿鱼须'.encode(), blob)
+        self.assertEqual(hmac.digest(self.device_key, blob[:-32], 'sha256'), blob[-32:])
+        self.assertEqual(self.db.execute('SELECT count(*) FROM delivery_tasks').fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT count(*) FROM cycling_routes').fetchone()[0], 0)
+        status, route_id = self.relay(self.packet(b'L1', ride))
+        self.assertEqual(status, 201)
+        self.assertEqual(self.relay(self.packet(b'L1', ride)), (200, route_id))
 
 
 def checkout(total='￥16.50', address='深圳测试地点'):

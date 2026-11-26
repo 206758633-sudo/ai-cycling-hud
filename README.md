@@ -1,6 +1,6 @@
 # AI骑行头显设备
 
-骑士 iOS App、ESP32-S3 头显固件和小智语音固件。骑士在手机上用高德骑行 SDK 规划路线，经蓝牙将下一步转向和距离发给头显。Mac 上的订单服务可选，用于手机与小智协作准备美团自提，付款由用户在美团完成。
+骑士 iOS App、ESP32-S3 头显与小智语音固件，以及 ESP32-C3 车载屏固件。骑士在手机上用高德骑行 SDK 规划路线，经蓝牙将下一步转向和距离发给头显。Mac 上的订单服务可选，用于手机与小智协作准备美团自提，付款由用户在美团完成。
 
 ## 目录
 
@@ -8,13 +8,14 @@
 | --- | --- |
 | [app/骑士Knight-iOS](app/骑士Knight-iOS) | Xcode 工程、App 页面、高德骑行导航、Core Bluetooth |
 | [firmware/knight_hud](firmware/knight_hud) | ESP32-S3 蓝牙头显与 SSD1306 OLED 固件 |
+| [firmware/knight_vehicle_c3](firmware/knight_vehicle_c3) | PANBOPO 360×360 车载屏、路线图与门店卡片 |
 | [firmware/xiaozhi-esp32](firmware/xiaozhi-esp32) | 小智语音固件、AI-MAIN 板型和自提回执 |
 | [server](server) | 可选的局域网订单服务、回归测试与头显调试工具 |
 | [docs/hud/ai-hud-protocol.md](docs/hud/ai-hud-protocol.md) | 蓝牙 UUID、UTF-8 分片和头显命令 |
 
 ## 双 ESP32 显示方案
 
-小智 ESP32-S3 负责语音与头盔 HUD，另一块 ESP32 驱动车载屏。骑士 App 统一算路并分别发送导航指引。方案已整理，双板联调和实体 HUD 验收待完成。[查看技术方案](docs/architecture/technical-architecture.md)
+小智 ESP32-S3 负责语音与头盔 HUD，另一块 ESP32 驱动车载屏。骑士 App 用高德算路，可向 C3 同步路线、位置、转向和距离。实体头盔 HUD 验收待完成。[查看技术方案](docs/architecture/technical-architecture.md)
 
 ## 构建 iPhone App
 
@@ -53,14 +54,19 @@ python3 server/knight_orders.py --interface en0
 
 在 Mac 上用 `networksetup -listallhardwareports` 确认实际网卡，按需替换 `en0`。iOS 构建传入 `-xcconfig ~/.local/share/knight-orders/iPhone.xcconfig`。AI-MAIN 固件构建会读取同目录的 `knight_order_build.h`，也可在 ESP-IDF 中用 `KNIGHT_ORDERS_CONFIG_DIR` 指定配置目录。配置、密钥和订单数据库保存在本机。
 
+## 语音任务与车载屏
+
+- 找附近餐厅时，骑士在 iPhone 调试版内只读查询美团，核对城市、地标及评分，再将该门店和最多三道可核实的菜发送到 C3。用户随后说「开始导航」，骑士才启动到同一分店的高德骑行导航。
+- 小布可经签名蓝牙把查店、点单和骑行请求交给骑士转发。普通骑行可独立发起，导航期间待办点单会暂停并在结束后续办。车载屏短暂显示订单更新，再继续展示路线。
+- 付款在美团由用户完成。查店任务保持购物车和交易状态。
+
 ## 验证状态
 
-- 骑士内置高德地图覆盖导航、自提、自由骑行、个人轨迹与打卡。车队位置共享待接入。骑行实测曾用蓝牙测试接收器核对「67 米后右转」，实体双屏和实骑轨迹待验收。
-- 语音控屏显示小布自提任务的进展。核实结算后，小布播报门店、规格、价格和待付款状态。用户说「开始导航」后，骑士请求高德 GPS 骑行导航，并在 SDK 确认启动后更新回执。
-- 24 项订单测试及静默接口验证通过。结算弹窗修复已回放验证。新版小布固件的烧录、真实语音往返及这一版语音启动导航的真机联调待验收。
-- 车载屏能重组正常导航分片。异常分片序号校验待完善。
+- 骑士内置高德地图覆盖导航、自提、自由骑行、个人轨迹与打卡。车队位置共享和实体头盔 HUD 待验收。
+- 广州黄村地铁站附近的美团语音查店、C3 店名及三道菜显示、语音确认启动高德骑行和 C3 路线同步均已真机验证。地址流程修订后，黄村地铁站 B 口的只读预检已收到 C3 接收确认。修订版本的完整真人语音复测待完成。
+- 29 项服务端回归测试通过。
 
-[骑行地图](docs/changes/complete-cycling-maps/proposal.md) · [语音控屏](docs/changes/hands-free-voice-control/proposal.md) · [自提结算及语音启动导航](docs/changes/verify-voice-pickup-navigation/proposal.md)
+[骑行地图](docs/changes/complete-cycling-maps/proposal.md) · [语音控屏](docs/changes/hands-free-voice-control/proposal.md) · [自提结算及语音启动导航](docs/changes/verify-voice-pickup-navigation/proposal.md) · [美团查店和小屏推荐](docs/changes/voice-meituan-store-recommendation/proposal.md) · [签名蓝牙中继](docs/changes/relay-knight-voice-requests/proposal.md) · [C3 构建与屏幕协议](firmware/knight_vehicle_c3/README.md)
 
 ```sh
 python3 -m unittest discover -s server

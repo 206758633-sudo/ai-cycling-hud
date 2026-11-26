@@ -92,18 +92,26 @@ def initialize(db):
         db.execute('ALTER TABLE delivery_tasks ADD COLUMN resumed_from TEXT')
     if 'cart_added' not in columns:
         db.execute('ALTER TABLE delivery_tasks ADD COLUMN cart_added INTEGER NOT NULL DEFAULT 0')
+    if 'paused_for_route' not in columns:
+        db.execute('ALTER TABLE delivery_tasks ADD COLUMN paused_for_route TEXT')
+    if 'rescheduled_at' not in columns:
+        db.execute('ALTER TABLE delivery_tasks ADD COLUMN rescheduled_at INTEGER NOT NULL DEFAULT 0')
     db.execute('''CREATE TABLE IF NOT EXISTS pickup_rides (
         task_id TEXT PRIMARY KEY, state TEXT NOT NULL, asked_at INTEGER NOT NULL,
         lease TEXT, note TEXT NOT NULL DEFAULT ''
     )''')
 
 
+def execution_start(row):
+    return row['rescheduled_at'] or row['created_at']
+
+
 def display(row):
     fields = {key: (json.loads(value) if key in {'quote', 'pickup_navigation'} and value else value)
               for key, value in dict(row).items()
-              if key not in {'source', 'request_id', 'quote_fingerprint', 'phone_lease'}}
+              if key not in {'source', 'request_id', 'quote_fingerprint', 'phone_lease', 'rescheduled_at'}}
     if row['state'] in ('queued', 'preparing', 'pickup_checkout') or row['clarification'] == SUGAR_CLARIFICATION:
-        started_at = row['created_at'] if row['state'] in ('queued', 'preparing') else row['updated_at']
+        started_at = execution_start(row) if row['state'] in ('queued', 'preparing') else row['updated_at']
         fields['expires_in'] = max(0, started_at + MAX_AGE - int(time.time()))
     return {**fields, 'voice_request': row['source'] == 'device'}
 
@@ -139,7 +147,8 @@ def text_field(payload, key, size):
 
 def expire_phone_tasks(db, now):
     db.execute("""UPDATE delivery_tasks SET state='needs_input', updated_at=?, note='手机执行已超时，请在美团核对购物车'
-       WHERE pickup_destination<>'' AND (state='queued' OR (state='preparing' AND phone_lease IS NOT NULL)) AND created_at<=?""",
+       WHERE pickup_destination<>'' AND (state='queued' OR (state='preparing' AND phone_lease IS NOT NULL))
+         AND COALESCE(NULLIF(rescheduled_at,0),created_at)<=?""",
        (now, now - MAX_AGE))
     db.execute("""UPDATE delivery_tasks SET state='needs_input', updated_at=?, note='请在美团核对这笔结算'
        WHERE state='pickup_checkout' AND updated_at<=?""", (now, now - MAX_AGE))
@@ -162,8 +171,8 @@ def claim_phone_task(db, payload):
                        (lease, now, row['id']))
             row = task(db, row['id'])
         fields = display(row)
-        expected_store = (fields['pickup_navigation'] or {}).get('store') if row['resumed_from'] else None
-        return Status.OK, {**fields, 'expires_in': row['created_at'] + MAX_AGE - now,
+        expected_store = (fields['pickup_navigation'] or {}).get('store') if row['resumed_from'] or row['rescheduled_at'] else None
+        return Status.OK, {**fields, 'expires_in': execution_start(row) + MAX_AGE - now,
                            'expected_pickup_store': expected_store}
 
 
@@ -171,7 +180,7 @@ def finish_phone_task(db, task_id, payload):
     lease = text_field(payload, 'lease', 80)
     state = payload.get('state')
     cart_added = payload.get('cart_added', False)
-    if not REQUEST_ID.fullmatch(lease) or state not in ('needs_input', 'pickup_checkout'):
+    if not REQUEST_ID.fullmatch(lease) or state not in ('needs_input', 'pickup_checkout', 'paused'):
         raise DeliveryError(Status.BAD_REQUEST, 'invalid_phone_result')
     if type(cart_added) is not bool or cart_added and payload.get('clarification') is not None:
         raise DeliveryError(Status.BAD_REQUEST, 'invalid_cart_result')
@@ -179,7 +188,7 @@ def finish_phone_task(db, task_id, payload):
     with db:
         db.execute('BEGIN IMMEDIATE')
         row = task(db, task_id)
-        if row['phone_lease'] != lease or row['created_at'] + MAX_AGE <= now:
+        if row['phone_lease'] != lease or execution_start(row) + MAX_AGE <= now:
             raise DeliveryError(Status.CONFLICT, 'phone_lease_expired')
         if row['state'] == state:
             return Status.OK, display(row)
@@ -196,6 +205,18 @@ def finish_phone_task(db, task_id, payload):
             if not map_store or city and not re.fullmatch(r'[\u3400-\u9fff]{2,10}市', city):
                 raise DeliveryError(Status.BAD_REQUEST, 'invalid_pickup_navigation')
             navigation = dict(store=map_store, city=city)
+        if state == 'paused':
+            route_id = text_field(payload, 'paused_for_route', 32)
+            if (cart_added or row['cart_added'] or payload.get('clarification') is not None or
+                    not re.fullmatch(r'[a-f0-9]{32}', route_id)):
+                raise DeliveryError(Status.BAD_REQUEST, 'invalid_pickup_pause')
+            if not db.execute('SELECT 1 FROM cycling_routes WHERE id=?', (route_id,)).fetchone():
+                raise DeliveryError(Status.CONFLICT, 'cycling_route_not_found')
+            snapshot = json.dumps(navigation, ensure_ascii=False) if navigation else row['pickup_navigation']
+            db.execute("""UPDATE delivery_tasks SET state='paused', note='已暂停点单，导航结束后自动续办',
+                          paused_for_route=?, pickup_navigation=?, updated_at=? WHERE id=?""",
+                       (route_id, snapshot, now, task_id))
+            return Status.OK, display(task(db, task_id))
         if state == 'needs_input':
             note = text_field(payload, 'note', 180) or '请在美团核对本次自提任务'
         else:
@@ -241,8 +262,10 @@ def pickup_voice_feedback(db, task_id):
 
 def pickup_feedback_text(row, now, field_order=PICKUP_SUMMARY_FIELDS):
     state = row['state']
+    if state == 'paused':
+        return '取餐任务已保留。导航结束后骑士会自动续办。'
     if state in ('queued', 'preparing'):
-        if row['created_at'] + MAX_AGE > now:
+        if execution_start(row) + MAX_AGE > now:
             return None
         return '骑士自提任务处理超时。请打开骑士 App 或美团核对。'
     if state == 'pickup_checkout' and row['quote'] and row['phone_lease']:

@@ -2250,7 +2250,7 @@ function voiceControlCards(tasks) {
     const sugarQuestion = task.state === 'needs_input' && task.clarification === 'no_added_sugar';
     const status = sugarQuestion ? (task.expires_in <= 0 ? '答复已过期' : '等待语音答复')
       : task.expires_in <= 0 && ['queued', 'preparing', 'pickup_checkout'].includes(task.state) ? '任务已过期'
-      : ({queued:'已接收', preparing:'正在美团核对', pickup_checkout:'结算已就绪 · 待付款',
+      : ({queued:'已接收', preparing:'正在美团核对', paused:'点单已暂停 · 导航后续办', pickup_checkout:'结算已就绪 · 待付款',
         needs_input:task.cart_added ? '已加购 · 结算待核对' : '本次未完成',
         reviewed:'已确认回执', cancelled:'已取消'})[task.state] || '状态待同步';
     const quote = task.quote;

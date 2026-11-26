@@ -15,6 +15,9 @@
 #endif
 
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <vector>
 #include <sstream>
 #include <algorithm>
@@ -190,17 +193,23 @@ bool Ota::CheckVersion() {
         cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
         
         if (cJSON_IsNumber(timestamp)) {
-            // 设置系统时间
+            // Keep the clock on UTC so expiry checks use Unix timestamps.
             struct timeval tv;
-            double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
-            if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+            const auto ts = static_cast<long long>(timestamp->valuedouble);
+            if (cJSON_IsNumber(timezone_offset) && timezone_offset->valueint >= -14 * 60 &&
+                timezone_offset->valueint <= 14 * 60) {
+                // POSIX TZ offsets have the opposite sign of UTC offsets.
+                const int offset = timezone_offset->valueint;
+                const int minutes = std::abs(offset);
+                char timezone[16];
+                std::snprintf(timezone, sizeof(timezone), "LOC%c%02d:%02d", offset >= 0 ? '-' : '+',
+                              minutes / 60, minutes % 60);
+                setenv("TZ", timezone, 1);
+                tzset();
             }
-            
-            tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
-            tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
+
+            tv.tv_sec = static_cast<time_t>(ts / 1000);
+            tv.tv_usec = static_cast<suseconds_t>(ts % 1000) * 1000;
             settimeofday(&tv, NULL);
             has_server_time_ = true;
         }
